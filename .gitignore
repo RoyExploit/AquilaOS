@@ -1,0 +1,50 @@
+# ------------------------------------------------------------------ #
+# NEVER COMMIT: credentials, keys, local config, user data
+# ------------------------------------------------------------------ #
+# Local provider config -- contains API keys / base URLs / model choices.
+# config.yaml.example is the safe template that IS committed.
+config.yaml
+config.yaml.bak
+.env
+.env.*
+*.env
+
+# User data: run history database + everything the agents generate.
+agentos_memory.sqlite3
+*.sqlite3
+workspace/
+
+# ------------------------------------------------------------------ #
+# Python
+# ------------------------------------------------------------------ #
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+env/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# ------------------------------------------------------------------ #
+# Editors / OS
+# ------------------------------------------------------------------ #
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ------------------------------------------------------------------ #
+# Scratch / test output
+# ------------------------------------------------------------------ #
+_shot_*.png
+*.bak
+*.tmp
+*.log

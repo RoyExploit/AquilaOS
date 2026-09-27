@@ -1,0 +1,33 @@
+# Copy this to config.yaml and edit. Planner and worker can use DIFFERENT
+# providers/models -- e.g. a strong cloud model to plan, a fast local model
+# to write code.
+
+# --- No config.yaml present? The engine defaults to the built-in 'mock'
+#     provider so `python -m agentos.cli demo` always works with zero setup. ---
+
+planner:
+  provider: anthropic          # anthropic | openai | gemini | openrouter | ollama | lmstudio | mock
+  # model: auto                # cloud providers: no model needed -- it is
+  #                             # detected automatically from the API key.
+  #                             # Want a specific one? Just set its name/ID
+  #                             # here; if the provider later retires it,
+  #                             # AgentOS re-detects a working model on its own.
+  # api_key: sk-ant-...        # or set ANTHROPIC_API_KEY env var instead
+
+worker:
+  provider: openrouter
+  model: auto
+  # api_key: sk-or-...         # or set OPENROUTER_API_KEY env var instead
+
+# --- Fully offline example (no internet, no API keys) ---
+# planner:
+#   provider: ollama
+#   model: llama3.1
+#   base_url: http://localhost:11434
+# worker:
+#   provider: lmstudio
+#   model: local-model
+#   base_url: http://localhost:1234/v1
+
+max_repair_attempts: 3
+workspace_dir: workspace
