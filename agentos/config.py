@@ -16,11 +16,12 @@ class AgentOSConfig:
     # its success criteria; a rejection re-prompts the worker's repair loop.
     planner_review: bool = True
     # Let the agents touch files outside the projects folder (paths you tag
-    # with @ in the chat are always allowed on top of this).
-    allow_pc_access: bool = False
-    # Ask before running a terminal command (recommended). Turn off only if
-    # you want the agents to test things without prompts.
-    confirm_commands: bool = True
+    # with @ in the chat are always allowed on top of this). On by default:
+    # the platform is meant to work on your real machine.
+    allow_pc_access: bool = True
+    # Ask before running a terminal command. Off by default -- the agents are
+    # expected to run and test their own work without a prompt each time.
+    confirm_commands: bool = False
     # Optional terminal command the platform runs against every generated
     # project, e.g. "python -m pytest -q" or "npm test". Empty = skip.
     test_command: str = ""
@@ -39,8 +40,8 @@ class AgentOSConfig:
             max_repair_attempts=raw.get("max_repair_attempts", 3),
             workspace_dir=raw.get("workspace_dir", "workspace"),
             planner_review=bool(raw.get("planner_review", True)),
-            allow_pc_access=bool(raw.get("allow_pc_access", False)),
-            confirm_commands=bool(raw.get("confirm_commands", True)),
+            allow_pc_access=bool(raw.get("allow_pc_access", True)),
+            confirm_commands=bool(raw.get("confirm_commands", False)),
             test_command=str(raw.get("test_command", "") or ""),
         )
 

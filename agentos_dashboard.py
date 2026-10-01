@@ -71,6 +71,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtGui import (
     QFileSystemModel, QColor, QFont, QIcon, QFontMetrics,
     QSyntaxHighlighter, QTextCharFormat, QPainter, QShortcut, QKeySequence,
+    QTextCursor,
 )
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -661,6 +662,140 @@ class ChatWorker(QObject):
             self.failed.emit(str(e))
 
 
+class ClickableLabel(QLabel):
+    """A QLabel that behaves like a button (used for the model showcase)."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class ChatInput(QPlainTextEdit):
+    """The chat box: wraps and grows with what you type (1-6 lines).
+
+    A single-line QLineEdit cannot wrap or grow, which is why long messages
+    used to run off the edge of the box instead of pushing it taller -- the
+    "box never resizes" problem. Enter sends, Shift+Enter adds a line.
+
+    It keeps the small QLineEdit-style surface (``text``/``setText``/
+    ``clear``/``setCompleter``/``textEdited``) so the rest of the panel --
+    including @file completion -- works unchanged.
+    """
+
+    submitted = pyqtSignal()
+    textEdited = pyqtSignal(str)
+
+    MIN_H = 34
+    MAX_H = 168
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("chatInput")
+        self.setTabChangesFocus(True)
+        self.setLineWrapMode(QPlainTextEdit.LineWrapMode.WidgetWidth)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(self.MIN_H)
+        self._completer = None
+        self.textChanged.connect(self._autogrow)
+
+    # ---------------- QLineEdit-compatible surface ---------------- #
+
+    def text(self) -> str:
+        return self.toPlainText()
+
+    def setText(self, value: str):
+        self.setPlainText(value)
+
+    def setCompleter(self, completer):
+        """Reuse the existing QCompleter, popped up manually below."""
+        self._completer = completer
+        completer.setWidget(self)
+        completer.activated.connect(self._apply_completion)
+
+    def _apply_completion(self, text: str):
+        """Replace the @word being typed with the picked file name."""
+        body = self.toPlainText()
+        at = body.rfind("@")
+        cursor = self.textCursor()
+        if at >= 0:
+            cursor.setPosition(at)
+            cursor.movePosition(QTextCursor.MoveOperation.End,
+                                QTextCursor.MoveMode.KeepAnchor)
+        cursor.insertText(text + " ")
+        self.setTextCursor(cursor)
+
+    # ---------------- self-sizing ---------------- #
+
+    def _autogrow(self):
+        """Height follows the text, counting wrapped lines, between MIN_H and
+        MAX_H. Computed from the font metrics rather than the document layout
+        so it is correct even before the widget has been laid out."""
+        metrics = self.fontMetrics()
+        width = max(120, self.viewport().width() or self.width() or 240)
+        doc = self.document()
+        lines = doc.blockCount()
+        for i in range(doc.blockCount()):
+            text = doc.findBlockByNumber(i).text()
+            if text:
+                # how many extra rows this paragraph wraps onto
+                lines += int(metrics.horizontalAdvance(text) // max(1, width))
+        height = max(self.MIN_H, min(self.MAX_H, lines * metrics.lineSpacing() + 14))
+        if height != self.height():
+            self.setFixedHeight(height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._autogrow()
+
+    # ---------------- keys ---------------- #
+
+    def keyPressEvent(self, event):
+        popup = self._completer.popup() if self._completer else None
+        if popup is not None and popup.isVisible() and event.key() in (
+            Qt.Key.Key_Enter, Qt.Key.Key_Return, Qt.Key.Key_Tab,
+            Qt.Key.Key_Up, Qt.Key.Key_Down, Qt.Key.Key_Escape,
+        ):
+            event.ignore()      # the completion popup owns these keys
+            return
+        # Enter sends, Shift+Enter makes a new line (ChatGPT behaviour).
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and not (
+            event.modifiers() & Qt.KeyboardModifier.ShiftModifier
+        ):
+            self.submitted.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+        self.textEdited.emit(self.toPlainText())
+        self._maybe_complete()
+
+    def _maybe_complete(self):
+        """Pop the @file list up while an @word is being typed."""
+        if self._completer is None:
+            return
+        word = self.toPlainText().rsplit("\n", 1)[-1].rsplit(" ", 1)[-1]
+        if not word.startswith("@") or len(word) < 2:
+            self._completer.popup().hide()
+            return
+        self._completer.setCompletionPrefix(word)
+        if self._completer.completionCount() == 0:
+            self._completer.popup().hide()
+            return
+        rect = self.cursorRect()
+        rect.setWidth(self._completer.popup().sizeHintForColumn(0)
+                      + self._completer.popup().verticalScrollBar().sizeHint().width()
+                      + 24)
+        self._completer.complete(rect)
+
+
 class ChatPanel(QWidget):
     """Chat section of the Home screen -- the human side of the platform.
 
@@ -697,6 +832,12 @@ class ChatPanel(QWidget):
         self.workspace_tabs = None
         self.project_root = ""
         self.last_tagged: list[str] = []
+        # Live catalog for the role's provider: used to render the model
+        # showcase and to fill the "switch model" menu.
+        self._catalog: list[str] = []
+        self._resolved = ""
+        self._model_thread = None
+        self._model_worker = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -731,9 +872,14 @@ class ChatPanel(QWidget):
         self.role_combo.currentIndexChanged.connect(self._refresh_role_chip)
         head.addWidget(self.role_combo)
 
-        self.model_chip = QLabel("")
+        self.model_chip = ClickableLabel("")
         self.model_chip.setObjectName("modelChip")
-        self.model_chip.setToolTip("Provider / model answering in this chat.")
+        self.model_chip.setToolTip(
+            "The model that actually answers here \u2014 auto-detected from your "
+            "API key.\nClick to switch model; the choice is saved, so Settings "
+            "shows it too."
+        )
+        self.model_chip.clicked.connect(self._open_model_menu)
         head.addWidget(self.model_chip)
         root.addLayout(head)
 
@@ -811,43 +957,38 @@ class ChatPanel(QWidget):
 
         input_row = QHBoxLayout()
         input_row.setSpacing(8)
-        self.input = QLineEdit()
-        self.terminal_mode = False
-        self.input.setPlaceholderText("Type a message\u2026 prefix @ to attach a file")
-        self.input.setToolTip(
-            "One send button: the planner answers, and if what you asked for is "
-            "a real build/fix it dispatches it to the workers automatically.\n"
-            "Type @ to attach a file (contents+path are given to the model).\n"
-            "Click \u2318 Command to run a terminal command instead."
+        self.input = ChatInput()
+        self.input.setPlaceholderText(
+            "Message the planner\u2026   $ command   /help"
         )
-        self.input.returnPressed.connect(self._on_send)
+        self.input.setToolTip(
+            "Just type and press Enter \u2014 the planner answers, and if you "
+            "asked for a real build it dispatches the workers automatically.\n"
+            "\u2022  @file   attach a file (its path + contents go to the model)\n"
+            "\u2022  $ cmd   run a terminal command on this PC  (e.g. $ pytest -q)\n"
+            "\u2022  /help   list every command\n"
+            "Shift+Enter makes a new line. The box grows as you type."
+        )
+        self.input.submitted.connect(self._on_send)
         self._setup_tag_completer()
 
-        self.send_button = QPushButton("Send \u00B7 ask")
+        self.send_button = QPushButton("Send \u21B5")
         self.send_button.setObjectName("primaryButton")
         self.send_button.setToolTip(
             "Ask the planner. If your message is a build/fix request it "
             "dispatches the workers to do it \u2014 one click, no guessing."
         )
         self.send_button.clicked.connect(self._on_send)
-        self.command_button = QPushButton("\u2318 Command")
-        self.command_button.setObjectName("thinkToggle")
-        self.command_button.setToolTip(
-            "Run a terminal command on your PC from here (e.g. pytest, python "
-            "app.py, pip install -r requirements.txt). You are asked first."
-        )
-        self.command_button.clicked.connect(self._toggle_command_mode)
 
         input_row.addWidget(self.input, stretch=1)
-        input_row.addWidget(self.command_button)
-        input_row.addWidget(self.send_button)
+        input_row.addWidget(self.send_button,
+                            alignment=Qt.AlignmentFlag.AlignBottom)
         root.addLayout(input_row)
 
         helper = QLabel(
-            "Send = the planner answers (and builds it if you asked for that) "
-            "\u00B7 @ = attach a file to the message \u00B7 \u2318 Command = run a "
-            "terminal command \u00B7 drag over any text to copy \u00B7 Ctrl +/- "
-            "zooms this chat"
+            "Enter = send \u00B7 Shift+Enter = new line \u00B7 @ = attach a file "
+            "\u00B7 $ = run a terminal command \u00B7 /help = command list "
+            "\u00B7 drag over any text to copy \u00B7 Ctrl +/- zooms this chat"
         )
         helper.setObjectName("hintLabel")
         helper.setWordWrap(True)
@@ -927,25 +1068,21 @@ class ChatPanel(QWidget):
             chunks.append(f"\n--- {path} ---\n{body}")
         return "\n".join(chunks)
 
-    # ---------------- terminal / command mode ---------------- #
+    # ---------------- terminal commands ---------------- #
 
-    def _toggle_command_mode(self):
-        self.terminal_mode = not self.terminal_mode
-        if self.terminal_mode:
-            self.command_button.setObjectName("navButton")
-            self.command_button.setText("\u2318 Command \u00B7 ON")
-            self.input.setPlaceholderText(
-                "Terminal command \u2014 e.g. pytest -q   or   python app.py"
-            )
-        else:
-            self.command_button.setObjectName("thinkToggle")
-            self.command_button.setText("\u2318 Command")
-            self.input.setPlaceholderText(
-                "Type a message\u2026 prefix @ to attach a file"
-            )
-        # re-apply the stylesheet so the colour follows the object name
-        self.command_button.style().unpolish(self.command_button)
-        self.command_button.style().polish(self.command_button)
+    def _show_command_help(self):
+        """Typing /help lists every command -- no buttons or switches needed."""
+        self.append_system(
+            "\u2318 Commands \u2014 type these straight into the box:\n"
+            "$ <cmd>   run a terminal command here (e.g. $ pytest -q)\n"
+            "          also: $ python app.py   \u00B7   $ pip install -r requirements.txt\n"
+            "! <cmd>   same as $ (quick form)\n"
+            "@file     attach a file so the model can read it\n"
+            "/help     this list\n"
+            "Runs happen inside your projects folder; anything you @-tagged is "
+            "allowed too. Output appears right here, and you can just run it "
+            "again after asking for a fix."
+        )
 
     # ---------------- zoom ---------------- #
 
@@ -1116,9 +1253,7 @@ class ChatPanel(QWidget):
         self.send_button.setEnabled(ready)
         if ready:
             self.input.setPlaceholderText(
-                "Terminal command \u2014 e.g. pytest -q   or   python app.py"
-                if self.terminal_mode
-                else "Type a message\u2026 prefix @ to attach a file"
+                "Message the planner\u2026   $ command   /help"
             )
             self.set_idle("Ready")
         else:
@@ -1183,10 +1318,117 @@ class ChatPanel(QWidget):
         self._refresh_role_chip()
 
     def _refresh_role_chip(self):
+        """Show which model answers here, then refresh the live catalog."""
+        self._render_chip()
+        self._start_model_fetch()
+
+    def _spec_for(self, role: str) -> dict:
+        return dict(getattr(self.config, role, {}) or {})
+
+    def _render_chip(self):
         role = self.role_combo.currentData() or "planner"
-        spec = getattr(self.config, role, {}) or {}
-        model = spec.get("model", "auto") or "auto"
-        self.model_chip.setText(f"{spec.get('provider', '?')} / {model}")
+        spec = self._spec_for(role)
+        provider = spec.get("provider", "?")
+        pinned = (spec.get("model") or "auto").strip() or "auto"
+        shown = self._resolved or pinned
+        arrow = " \u25BE" if provider in PROVIDER_REGISTRY and provider != "mock" else ""
+        self.model_chip.setText(f"{provider} / {shown}{arrow}")
+
+    def _start_model_fetch(self):
+        """Ask the provider which models this key can reach (off the UI thread)
+        so the chip can show the real model and the menu can list choices."""
+        role = self.role_combo.currentData() or "planner"
+        spec = self._spec_for(role)
+        provider = spec.pop("provider", "")
+        if provider not in PROVIDER_REGISTRY or provider == "mock":
+            self._catalog, self._resolved = [], ""
+            return
+        if self._model_thread is not None:
+            return                      # one catalog fetch at a time
+        spec.pop("model", None)
+        self._model_thread = QThread()
+        self._model_worker = ModelFetchWorker(provider, spec)
+        self._model_worker.moveToThread(self._model_thread)
+        self._model_thread.started.connect(self._model_worker.run)
+        self._model_worker.models_ready.connect(self._on_catalog)
+        self._model_worker.models_ready.connect(self._model_thread.quit)
+        self._model_worker.failed.connect(self._model_thread.quit)
+        # Drop our references only once the thread has REALLY stopped --
+        # clearing them from the result handler would hand a still-running
+        # QThread to the garbage collector ("Destroyed while running").
+        self._model_thread.finished.connect(self._finish_model_fetch)
+        self._model_thread.start()
+
+    def _finish_model_fetch(self):
+        self._model_thread = None
+        self._model_worker = None
+
+    def wait_for_model_fetch(self, timeout_ms: int = 6000):
+        """Let an in-flight catalog fetch finish (used on app close)."""
+        thread = self._model_thread
+        if thread is None:
+            return
+        thread.quit()
+        thread.wait(timeout_ms)
+
+    def _on_catalog(self, models):
+        role = self.role_combo.currentData() or "planner"
+        spec = self._spec_for(role)
+        cls = PROVIDER_REGISTRY.get(spec.get("provider", ""))
+        self._catalog = [m for m in (models or []) if m]
+        pinned = (spec.get("model") or "auto").strip()
+        preferred = pinned if pinned and pinned != "auto" else None
+        try:
+            self._resolved = cls.preferred_chat_model(self._catalog, preferred) if cls else ""
+        except Exception:
+            self._resolved = ""
+        self._render_chip()
+
+    def _open_model_menu(self):
+        """Click the chip -> pick Auto or any model this key can actually call."""
+        role = self.role_combo.currentData() or "planner"
+        spec = self._spec_for(role)
+        provider = spec.get("provider", "?")
+        current = (spec.get("model") or "auto").strip() or "auto"
+        menu = QMenu(self)
+        header = menu.addAction(f"{role.capitalize()} \u00b7 {provider}")
+        header.setEnabled(False)
+        if self._resolved:
+            live = menu.addAction(f"answering now: {self._resolved}")
+            live.setEnabled(False)
+        menu.addSeparator()
+        auto = menu.addAction("Auto \u2014 let the key/provider decide"
+                              + ("   \u2713" if current == "auto" else ""))
+        auto.triggered.connect(lambda: self._set_role_model("auto"))
+        if self._catalog:
+            menu.addSeparator()
+            for name in self._catalog[:30]:
+                act = menu.addAction(name + ("   \u2713" if name == current else ""))
+                act.triggered.connect(lambda _=False, n=name: self._set_role_model(n))
+        else:
+            wait = menu.addAction("Detecting models\u2026")
+            wait.setEnabled(False)
+        menu.addSeparator()
+        menu.addAction("Refresh list", self._start_model_fetch)
+        menu.exec(self.model_chip.mapToGlobal(self.model_chip.rect().bottomLeft()))
+
+    def _set_role_model(self, model: str):
+        """Change the role's model from the chat; persisted, so Settings and
+        the next run both use it."""
+        role = self.role_combo.currentData() or "planner"
+        spec = self._spec_for(role)
+        spec["model"] = model
+        setattr(self.config, role, spec)
+        try:
+            self.config.save()
+        except Exception as e:
+            self.append_system(f"\u26A0 Could not save the model choice: {e}")
+        self._resolved = ""
+        note = (" (auto: picked from your key when a request is made)"
+                if model == "auto" else "")
+        self.append_system(f"\u2699 {role.capitalize()} model \u2192 {model}{note}")
+        self._render_chip()
+        self._start_model_fetch()
 
     def _planner_model_warning(self) -> str | None:
         """Coder/completion models make poor planners -- they ignore the
@@ -1219,13 +1461,23 @@ class ChatPanel(QWidget):
         if not text or self._busy:
             return
 
-        # ---- terminal mode: hand the command to the dashboard runner ----
-        if self.terminal_mode:
+        # ---- commands are typed straight in: $cmd / !cmd run in a terminal ----
+        if text.startswith(("$", "!")):
+            command = text[1:].strip()
+            if not command:
+                self.append_system(
+                    "Type a command after $ \u2014 for example:  $ pytest -q"
+                )
+                return
             tags = self.tagged_paths()
-            self.append_system(f"\u2318 {text}")
             self.input.clear()
+            self.append_user(text)
             self.set_activity("Running command")
-            self.command_requested.emit(text, tags)
+            self.command_requested.emit(command, tags)
+            return
+        if text.split()[0].lower() in ("/help", "/commands", "help"):
+            self.input.clear()
+            self._show_command_help()
             return
 
         # ---- normal chat: attach any @tagged files to the prompt ----
@@ -1707,9 +1959,6 @@ class WorkspaceTabs(QWidget):
         if os.path.isdir(full) or not os.path.exists(full):
             return
         self.open_file(full)
-        if os.path.isdir(full) or not os.path.exists(full):
-            return
-        self.open_file(full)
 
 
 # --------------------------------------------------------------------- #
@@ -1752,15 +2001,6 @@ class FilesPanel(QWidget):
         files_title = QLabel("\U0001F4C1  Files")
         files_title.setObjectName("panelTitle")
         files_head.addWidget(files_title)
-        self.code_toggle = QPushButton("\u25A4 Code")
-        self.code_toggle.setObjectName("thinkToggle")
-        self.code_toggle.setCheckable(True)
-        self.code_toggle.setChecked(True)
-        self.code_toggle.setToolTip(
-            "Show/hide the code column (middle). Closing every file hides it "
-            "automatically so the chat gets the whole space."
-        )
-        files_head.addWidget(self.code_toggle)
         files_head.addStretch(1)
         self.changed_label = QLabel("")
         self.changed_label.setObjectName("hintLabel")
@@ -1841,7 +2081,6 @@ class FilesPanel(QWidget):
         if self.workspace_tabs is not None:
             self.workspace_tabs.open_file(path)
             self.update_open_list(self.workspace_tabs.open_paths())
-        self._watch_if_new(path)
         self._watch_if_new(path)
 
     def _watch_if_new(self, path: str):
@@ -2164,24 +2403,11 @@ class SettingsDialog(QDialog):
         )
         self.review_check.setChecked(getattr(config, "planner_review", True))
         general_form.addRow("", self.review_check)
-
-        self.pc_access_check = QCheckBox(
-            "Allow the agents to read/write files anywhere on this PC"
-        )
-        self.pc_access_check.setChecked(getattr(config, "allow_pc_access", False))
-        self.pc_access_check.setToolTip(
-            "Off by default: the agents stay inside your projects folder plus any "
-            "file you tag with @ in the chat."
-        )
-        general_form.addRow("", self.pc_access_check)
-
-        self.confirm_commands_check = QCheckBox(
-            "Ask me before the agent runs a terminal command"
-        )
-        self.confirm_commands_check.setChecked(
-            getattr(config, "confirm_commands", True)
-        )
-        general_form.addRow("", self.confirm_commands_check)
+        # Terminal access is always on: these two used to be checkboxes, but
+        # the agents are meant to run commands and test their own work, so
+        # there is nothing to switch on or off.
+        self.config.allow_pc_access = True
+        self.config.confirm_commands = False
 
         self.test_command_edit = QLineEdit(getattr(config, "test_command", "") or "")
         self.test_command_edit.setPlaceholderText(
@@ -2244,8 +2470,8 @@ class SettingsDialog(QDialog):
             "max_repair": self.max_repair_spin.value(),
             "workspace": self.workspace_edit.text().strip(),
             "review": self.review_check.isChecked(),
-            "pc_access": self.pc_access_check.isChecked(),
-            "confirm_commands": self.confirm_commands_check.isChecked(),
+            "pc_access": True,
+            "confirm_commands": False,
             "test_command": self.test_command_edit.text().strip(),
         }
 
@@ -2301,8 +2527,9 @@ class SettingsDialog(QDialog):
         self.config.max_repair_attempts = self.max_repair_spin.value()
         self.config.workspace_dir = self.workspace_edit.text().strip() or "workspace"
         self.config.planner_review = self.review_check.isChecked()
-        self.config.allow_pc_access = self.pc_access_check.isChecked()
-        self.config.confirm_commands = self.confirm_commands_check.isChecked()
+        # always on: agents may test their own work anywhere on this PC
+        self.config.allow_pc_access = True
+        self.config.confirm_commands = False
         self.config.test_command = self.test_command_edit.text().strip()
         try:
             path = self.config.save()
@@ -2445,6 +2672,10 @@ class Dashboard(QMainWindow):
 
     def closeEvent(self, event):
         self._save_ui_state()
+        try:
+            self.chat_panel.wait_for_model_fetch()
+        except Exception:
+            pass
         super().closeEvent(event)
 
     def _install_shortcuts(self):
@@ -2592,7 +2823,6 @@ class Dashboard(QMainWindow):
         self.home_tabs.file_saved.connect(
             lambda p: self.chat_panel.append_system(f"\U0001F4BE Saved {os.path.basename(p)}")
         )
-        self.home_files.code_toggle.toggled.connect(lambda _on: self._sync_code_pane())
         self.chat_panel.run_requested.connect(self._on_run_requested)
         self.chat_panel.choose_folder_requested.connect(self._choose_projects_folder)
         self.chat_panel.command_requested.connect(self._on_command_requested)
@@ -2612,15 +2842,11 @@ class Dashboard(QMainWindow):
         return page
 
     def _sync_code_pane(self, restoring: bool = False):
-        """Code column visible only when a file is open AND the toggle is on.
-        Closing the last tab hides it, handing the space back to the chat."""
+        """The code column is visible exactly when a file is open -- there is
+        no switch to forget about. Closing the last tab hands its space back
+        to the chat."""
         has_tabs = self.home_tabs.tabs.count() > 0
-        toggle = self.home_files.code_toggle
-        if not has_tabs and not toggle.isChecked():
-            toggle.blockSignals(True)
-            toggle.setChecked(True)
-            toggle.blockSignals(False)
-        self.home_tabs.setVisible(has_tabs and toggle.isChecked())
+        self.home_tabs.setVisible(has_tabs)
         if has_tabs and not restoring:
             self.chat_panel.set_idle(self.chat_panel._hud_base)
 
@@ -3103,6 +3329,10 @@ class Dashboard(QMainWindow):
             self.home_files.update_open_list(self.home_tabs.open_paths())
             self.fs_model.setRootPath(root)
             self.file_tree.setRootIndex(self.fs_model.index(root))
+            # bring the user to the code they just generated
+            home_btn = self.nav_buttons.get("Home")
+            if home_btn is not None and not home_btn.isChecked():
+                home_btn.click()
 
         project_id = report.get("project_id")
         if project_id:

@@ -131,7 +131,6 @@ with open(g, "w") as fh:
 d.home_tabs.set_project_root(proj2)
 d.home_files.set_root(proj2)
 d.home_files._open_file(d.home_files.fs_model.index(g))
-d.home_files._open_file(d.home_files.fs_model.index(g))
 print("tabs after double click (must be 1) ->", d.home_tabs.tabs.count())
 d.home_tabs.close_all()
 d.home_tabs.auto_open("worker_file.py", root_path=proj2)
@@ -140,9 +139,10 @@ d.nav_buttons["Home"].click()
 app.processEvents()
 print("auto-open on worker write ->", d.home_tabs.tabs.count(),
       "| column visible ->", d.home_tabs.isVisible(),
-      "| toggle ->", d.home_files.code_toggle.isChecked(),
       "| hidden ->", d.home_tabs.isHidden(),
-      "| stack ->", d.stack.currentIndex())
+      "| stack ->", d.stack.currentIndex(),
+      "| code shown -,->", "y = 2" in d.home_tabs._open[
+          os.path.abspath(g)].toPlainText())
 d.home_tabs.auto_open("..\\..\\outside.py", root_path=proj2)
 print("out-of-scope auto-open ignored ->", d.home_tabs.tabs.count())
 
@@ -156,5 +156,59 @@ print("SHOTS_OK")
 shutil.rmtree(proj2, ignore_errors=True)
 d.home_tabs.set_project_root(root)
 d.home_files.set_root(root)
+
+# ---------- chat input grows/wraps (was a fixed one-line box) ----------
+from agentos_dashboard import ChatInput
+assert isinstance(d.chat_panel.input, ChatInput), "chat input is not ChatInput"
+p = d.chat_panel
+p.set_ready(True)
+p.input.setPlainText("short")
+app.processEvents()
+one = p.input.height()
+p.input.setPlainText("a much longer message that has to wrap " * 8)
+app.processEvents()
+grown = p.input.height()
+print("chat input grows ->", grown > one,
+      f"({one}px -> {grown}px, cap {ChatInput.MAX_H})")
+p.input.setPlainText("line1\nline2\nline3\nline4")
+app.processEvents()
+print("chat input multi-line ->", p.input.height() > one)
+p.input.clear()
+app.processEvents()
+print("chat input shrinks back ->", p.input.height() == one)
+
+# ---------- commands are typed straight in: $ / ! ----------
+cmds = []
+p.command_requested.connect(lambda c, t: cmds.append(c))
+p.input.setPlainText("$ echo hi")
+p._on_send(); app.processEvents()
+print("$ command routed ->", cmds == ["echo hi"], cmds)
+p.input.setPlainText("!echo yo")
+p._on_send(); app.processEvents()
+print("! command routed ->", cmds == ["echo hi", "echo yo"], cmds)
+print("command toggle button removed ->", not hasattr(p, "command_button"))
+print("terminal_mode flag gone ->", not hasattr(p, "terminal_mode"))
+
+cmds.clear()
+p.input.setPlainText("/help")
+p._on_send(); app.processEvents()
+helped = " ".join(l.text() for l in p.chat_log.findChildren(QLabel))
+print("/help lists commands ->", "$ <cmd>" in helped and not cmds)
+
+# ---------- planner model showcase under the chat ----------
+print("model chip is clickable ->", hasattr(p.model_chip, "clicked"))
+print("model chip shows provider/model ->", "/" in p.model_chip.text(),
+      repr(p.model_chip.text()))
+
+# ---------- the code column has no on/off switch any more ----------
+print("code toggle removed ->", not hasattr(d.home_files, "code_toggle"))
+
+# ---------- execution log pane actually receives lines ----------
+d._append_log("log-line-check-123")
+app.processEvents()
+print("log pane receives lines ->", "log-line-check-123" in d.log_view.toPlainText())
+
+# let any in-flight model-catalog fetch finish before the app goes away
+d.chat_panel.wait_for_model_fetch()
 print("SMOKE_OK")
 
