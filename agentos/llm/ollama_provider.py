@@ -9,6 +9,9 @@ class OllamaProvider(LLMProvider):
     """
 
     name = "ollama"
+    # You deliberately pulled this model -- never silently swap it out on a
+    # transient error (retries only).
+    switch_model_on_overload = False
 
     def __init__(self, model: str = "llama3.1", base_url: str = "http://localhost:11434", **kwargs):
         super().__init__(model, **kwargs)

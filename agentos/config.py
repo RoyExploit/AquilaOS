@@ -15,6 +15,15 @@ class AgentOSConfig:
     # When True, the planner LLM reviews each worker-produced file against
     # its success criteria; a rejection re-prompts the worker's repair loop.
     planner_review: bool = True
+    # Let the agents touch files outside the projects folder (paths you tag
+    # with @ in the chat are always allowed on top of this).
+    allow_pc_access: bool = False
+    # Ask before running a terminal command (recommended). Turn off only if
+    # you want the agents to test things without prompts.
+    confirm_commands: bool = True
+    # Optional terminal command the platform runs against every generated
+    # project, e.g. "python -m pytest -q" or "npm test". Empty = skip.
+    test_command: str = ""
 
     @classmethod
     def load(cls, path: str | None = None) -> "AgentOSConfig":
@@ -30,6 +39,9 @@ class AgentOSConfig:
             max_repair_attempts=raw.get("max_repair_attempts", 3),
             workspace_dir=raw.get("workspace_dir", "workspace"),
             planner_review=bool(raw.get("planner_review", True)),
+            allow_pc_access=bool(raw.get("allow_pc_access", False)),
+            confirm_commands=bool(raw.get("confirm_commands", True)),
+            test_command=str(raw.get("test_command", "") or ""),
         )
 
     def to_dict(self) -> dict:
@@ -39,6 +51,9 @@ class AgentOSConfig:
             "max_repair_attempts": self.max_repair_attempts,
             "workspace_dir": self.workspace_dir,
             "planner_review": self.planner_review,
+            "allow_pc_access": self.allow_pc_access,
+            "confirm_commands": self.confirm_commands,
+            "test_command": self.test_command,
         }
 
     def save(self, path: str | None = None) -> str:

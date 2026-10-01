@@ -1,4 +1,4 @@
-"""AgentOS Dashboard - Phase 3 (single file).
+"""AquilaOS Dashboard (AgentOS engine) - single file.
 
 A PyQt6 desktop UI wired directly to the real Phase 1+2 engine
 (agentos.brain.CoreBrain + agentos.agents.MultiAgentCoordinator). It does
@@ -12,34 +12,73 @@ Requires the `agentos` package (Phase 1+2) importable -- keep this file
 in the same project root as the agentos/ folder, or `pip install -e .`
 it, or just leave it alongside as shipped in the delivered zip.
 
-Panels (top header nav switches between four sections):
-  - Home (default)  : left  = folder tree of generated files (click a file
-                         to read the code the models wrote)
-                      right = chat section -- talk directly to the planner
-                         model (it plans everything and hands tasks to the
-                         worker models); role selector picks Planner/Worker;
-                         Run feeds the message to the full agent pipeline
+Panels (top header nav):
+  - Home (default)  : LEFT   = files
+                      MIDDLE = coding center: tabs with numbered lines 1..N
+                               and syntax colors. Tabs open when clicked,
+                               and open by themselves when workers write
+                               code (watch it appear live).
+                      RIGHT  = chat with the models, plus a live HUD showing
+                               what is happening right now and how many lines
+                               were added/removed per file (green +, red -),
+                               plus "Think" cards with the planner's reasoning
   - Tasks            : Agent Dashboard + Task Queue + Execution Log +
                          Memory/History + Model Manager
-  - Files            : full-width file explorer + code viewer
-  - Settings         : provider/key dialog (same as before)
+  - Settings         : provider/key dialog + projects folder
+
+First run: the app asks where your projects live; chat stays disabled until
+a folder is chosen (change it later with the chat's "Folder..." button).
+Every message, diff line and error in the chat is drag-selectable and can be
+copied (Ctrl+C, right-click menu, or the Copy button).
 """
 import sys
 import os
 import re
 import json
+import yaml
+import threading
+from html import escape as html_escape
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QFileSystemModel, QColor, QFont, QIcon
+# ------------------------------------------------------------------ #
+# Remembered UI state: one JSON file per machine/user so the layout
+# adapts to whatever screen it runs on and is restored on next start.
+# ------------------------------------------------------------------ #
+UI_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ui_state.json")
+
+
+def load_ui_state() -> dict:
+    try:
+        with open(UI_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_ui_state(state: dict):
+    try:
+        with open(UI_STATE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=1)
+    except OSError:
+        pass  # layout simply isn't remembered; never break the app for this
+
+from PyQt6.QtCore import (
+    Qt, QThread, pyqtSignal, QObject, QTimer, QFileSystemWatcher, QStringListModel,
+    pyqtSlot, QMetaObject, Q_ARG,
+)
+from PyQt6.QtGui import (
+    QFileSystemModel, QColor, QFont, QIcon, QFontMetrics,
+    QSyntaxHighlighter, QTextCharFormat, QPainter, QShortcut, QKeySequence,
+)
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QSplitter, QLineEdit, QPushButton, QLabel, QTabWidget, QTableWidget,
     QTableWidgetItem, QPlainTextEdit, QTreeView, QGroupBox, QHeaderView,
     QMessageBox, QDialog, QDialogButtonBox, QComboBox, QSpinBox, QCheckBox,
     QScrollArea, QFrame, QSizePolicy, QStackedWidget, QTextBrowser,
-    QButtonGroup,
+    QButtonGroup, QMenu, QFileDialog, QTabBar, QCompleter, QInputDialog,
 )
 
 from agentos.config import AgentOSConfig
@@ -201,6 +240,99 @@ MODERN_STYLESHEET = f"""
         color: #8fb8ff;
         font-size: 11px;
         font-family: "Cascadia Code", "Consolas", monospace;
+    }}
+
+    /* ---- Workspace panels (files above, file contents below) ---- */
+    QFrame#panelCard {{
+        background-color: #0f121a;
+        border: 1px solid #232735;
+        border-radius: 14px;
+    }}
+
+    /* ---- Live HUD: what is happening right now + line deltas ---- */
+    QFrame#chatHud {{
+        background-color: rgba(23, 26, 36, 160);
+        border: 1px solid #232735;
+        border-radius: 12px;
+    }}
+    QLabel#hudDot {{ color: #7c5cff; font-size: 12px; }}
+    QLabel#hudText {{ color: #c9d4f2; font-size: 12px; }}
+    QLabel#hudDiff {{ font-size: 12px; font-weight: 700; }}
+    QLabel#diffLine {{ font-size: 11.5px; }}
+
+    /* ---- Code center: VS Code-like editor tabs ---- */
+    QTabWidget#codeTabs::pane {{
+        border: 1px solid #232735;
+        border-radius: 10px;
+        background-color: #0a0c12;
+        top: -1px;
+    }}
+    QTabBar#codeTabBar::tab {{
+        background-color: #0f121a;
+        color: #8b93a7;
+        border: 1px solid #232735;
+        border-bottom: none;
+        border-top-left-radius: 8px;
+        border-top-right-radius: 8px;
+        padding: 6px 10px 6px 14px;
+        margin-right: 3px;
+    }}
+    QTabBar#codeTabBar::tab:selected {{
+        background-color: #171a24;
+        color: #f2f3f8;
+    }}
+    QTabBar#codeTabBar::tab:hover:!selected {{
+        color: #d7dae4;
+    }}
+    QPushButton#tabClose {{
+        background-color: transparent;
+        border: none;
+        color: #5b6172;
+        font-size: 13px;
+        font-weight: 700;
+        padding: 0px;
+    }}
+    QPushButton#tabClose:hover {{
+        color: #f85149;
+    }}
+
+    /* ---- Planner/worker "Think" stream (compact, expandable) ---- */
+    QPushButton#thinkToggle {{
+        background-color: transparent;
+        border: 1px solid #2a2f3f;
+        border-radius: 999px;
+        color: #8b93a7;
+        padding: 5px 12px;
+        font-size: 11.5px;
+        font-weight: 600;
+    }}
+    QPushButton#thinkToggle:checked {{
+        background-color: #1b1e33;
+        border: 1px solid #3a3480;
+        color: #a89bff;
+    }}
+    QPushButton#thinkLine {{
+        background-color: transparent;
+        border: none;
+        color: #8fb8ff;
+        font-size: 11.5px;
+        text-align: left;
+        padding: 2px 0px;
+    }}
+    QPushButton#thinkLine:hover {{ color: #b9d0ff; }}
+    QLabel#thinkBody {{
+        color: #9aa3b8;
+        font-size: 11.5px;
+        font-family: "Cascadia Code", "Consolas", monospace;
+        padding-left: 14px;
+    }}
+    QLabel#terminalLine {{
+        color: #c9d4f2;
+        background-color: #0a0c12;
+        border-left: 2px solid #7c5cff;
+        padding: 6px 8px;
+        font-family: "Cascadia Code", "Consolas", monospace;
+        font-size: 11.5px;
     }}
 
     /* ---- Cards / group boxes ---- */
@@ -399,11 +531,15 @@ class BrainWorker(QObject):
     finished = pyqtSignal(dict)
     failed = pyqtSignal(str)
 
-    def __init__(self, goal: str, project_name: str, config: AgentOSConfig):
+    def __init__(self, goal: str, project_name: str, config: AgentOSConfig,
+                 extra_roots=None, command_approver=None, test_command: str = ""):
         super().__init__()
         self.goal = goal
         self.project_name = project_name
         self.config = config
+        self.extra_roots = list(extra_roots or [])
+        self.command_approver = command_approver
+        self.test_command = test_command
 
     def run(self):
         try:
@@ -414,6 +550,10 @@ class BrainWorker(QObject):
                 workspace_dir=self.config.workspace_dir,
                 max_repair_attempts=self.config.max_repair_attempts,
                 planner_review=getattr(self.config, "planner_review", True),
+                extra_roots=self.extra_roots,
+                allow_outside=getattr(self.config, "allow_pc_access", False),
+                command_approver=self.command_approver,
+                test_command=self.test_command,
             )
 
             def progress_cb(evt: dict):
@@ -522,15 +662,22 @@ class ChatWorker(QObject):
 
 
 class ChatPanel(QWidget):
-    """The right-hand chat section of the Home screen.
+    """Chat section of the Home screen -- the human side of the platform.
 
-    Lets you converse directly with the configured LLM -- the planner by
-    default, since it plans everything and dispatches tasks to the worker
-    models. The role pill switches between Planner/Worker (which model
-    answers), and Run hands the current input to the full agent pipeline.
+    The UI spells the rules out in plain language so nothing is a mystery:
+
+      * Send   -> talk to the selected model (answer in chat, nothing built)
+      * Run    -> build it: the planner plans, worker agents create the files
+      * Think  -> show/hide the planner's + workers' reasoning cards
+      * Folder -> pick where projects are created/opened (also the first-run
+                  gate: chat stays disabled until a folder is chosen)
+      * Copy   -> copy the whole conversation; every message, diff line and
+                  error is drag-selectable too.
     """
 
-    run_requested = pyqtSignal(str)  # goal text from the input box
+    run_requested = pyqtSignal(str)          # goal text -> full pipeline
+    choose_folder_requested = pyqtSignal()   # "Folder..." clicked
+    command_requested = pyqtSignal(str, list)  # command, approved roots
 
     def __init__(self, config: AgentOSConfig, parent=None):
         super().__init__(parent)
@@ -539,26 +686,87 @@ class ChatPanel(QWidget):
         self._worker = None
         self._busy = False
         self._warned_about_model = False
+        self._ready = False
+        self._transcript: list[str] = []
+        self._thinking_cards: list[QWidget] = []
+        self._added = 0
+        self._removed = 0
+        self._hud_base = ""
+        self._hud_dots = 0
+        self._zoom = 1.0
+        self.workspace_tabs = None
+        self.project_root = ""
+        self.last_tagged: list[str] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(10)
 
+        # ---------------- header row ---------------- #
         head = QHBoxLayout()
         head.setSpacing(8)
         title = QLabel("\U0001F4AC  Chat")
         title.setObjectName("panelTitle")
         head.addWidget(title)
         head.addStretch(1)
+
+        self.think_button = QPushButton("\U0001F9E0 Think")
+        self.think_button.setObjectName("thinkToggle")
+        self.think_button.setCheckable(True)
+        self.think_button.setChecked(True)
+        self.think_button.setToolTip(
+            "Show/hide what the planner and the workers are actually thinking:\n"
+            "the plan tree, each worker's task, planner review verdicts and\n"
+            "re-prompts. Click a card to expand it."
+        )
+        self.think_button.toggled.connect(self._on_think_toggled)
+        head.addWidget(self.think_button)
+
         self.role_combo = QComboBox()
         self.role_combo.setObjectName("roleCombo")
+        self.role_combo.setToolTip(
+            "Which configured model answers you here: the Planner (it plans\n"
+            "and dispatches the work) or a Worker model."
+        )
         self.role_combo.currentIndexChanged.connect(self._refresh_role_chip)
         head.addWidget(self.role_combo)
+
         self.model_chip = QLabel("")
         self.model_chip.setObjectName("modelChip")
+        self.model_chip.setToolTip("Provider / model answering in this chat.")
         head.addWidget(self.model_chip)
         root.addLayout(head)
 
+        # ---------------- live HUD ---------------- #
+        self.hud = QFrame()
+        self.hud.setObjectName("chatHud")
+        hud_row = QHBoxLayout(self.hud)
+        hud_row.setContentsMargins(12, 7, 12, 7)
+        hud_row.setSpacing(10)
+        self.hud_dot = QLabel("\u25CF")
+        self.hud_dot.setObjectName("hudDot")
+        hud_row.addWidget(self.hud_dot)
+        self.hud_activity = QLabel("Idle")
+        self.hud_activity.setObjectName("hudText")
+        self.hud_activity.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        hud_row.addWidget(self.hud_activity, stretch=1)
+        self.hud_diff = QLabel("")
+        self.hud_diff.setObjectName("hudDiff")
+        self.hud_diff.setTextFormat(Qt.TextFormat.RichText)
+        self.hud_diff.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.hud_diff.setToolTip("Lines added / removed by the workers in this run.")
+        hud_row.addWidget(self.hud_diff)
+        root.addWidget(self.hud)
+
+        self._hud_timer = QTimer(self)
+        self._hud_timer.setInterval(420)
+        self._hud_timer.timeout.connect(self._tick_hud)
+
+        # ---------------- conversation ---------------- #
         self.chat_scroll = QScrollArea()
         self.chat_scroll.setObjectName("chatScroll")
         self.chat_scroll.setWidgetResizable(True)
@@ -577,37 +785,213 @@ class ChatPanel(QWidget):
         self.chat_scroll.setWidget(self.chat_log)
         root.addWidget(self.chat_scroll, stretch=1)
 
+        # ---------------- controls ---------------- #
+        folder_row = QHBoxLayout()
+        folder_row.setSpacing(8)
+        folder_label = QLabel("Project:")
+        folder_label.setObjectName("hintLabel")
+        folder_row.addWidget(folder_label)
+        self.project_input = QLineEdit("generated_project")
+        self.project_input.setPlaceholderText("project folder name")
+        self.project_input.setMaximumWidth(180)
+        self.project_input.setToolTip(
+            "Folder name the project is created in, inside your projects folder."
+        )
+        folder_row.addWidget(self.project_input)
+        self.folder_button = QPushButton("\U0001F4C2 Folder\u2026")
+        self.folder_button.setObjectName("thinkToggle")
+        self.folder_button.setToolTip(
+            "Choose the folder where projects are created or opened.\n"
+            "Chat and runs only work once a folder is selected."
+        )
+        self.folder_button.clicked.connect(self.choose_folder_requested.emit)
+        folder_row.addWidget(self.folder_button)
+        folder_row.addStretch(1)
+        root.addLayout(folder_row)
+
         input_row = QHBoxLayout()
         input_row.setSpacing(8)
         self.input = QLineEdit()
-        self.input.setPlaceholderText(
-            "Message the planner directly, or type a goal and press Run\u2026"
+        self.terminal_mode = False
+        self.input.setPlaceholderText("Type a message\u2026 prefix @ to attach a file")
+        self.input.setToolTip(
+            "One send button: the planner answers, and if what you asked for is "
+            "a real build/fix it dispatches it to the workers automatically.\n"
+            "Type @ to attach a file (contents+path are given to the model).\n"
+            "Click \u2318 Command to run a terminal command instead."
         )
         self.input.returnPressed.connect(self._on_send)
-        self.project_input = QLineEdit("generated_project")
-        self.project_input.setPlaceholderText("project name")
-        self.project_input.setMaximumWidth(160)
-        self.send_button = QPushButton("Send")
+        self._setup_tag_completer()
+
+        self.send_button = QPushButton("Send \u00B7 ask")
         self.send_button.setObjectName("primaryButton")
-        self.send_button.clicked.connect(self._on_send)
-        self.run_button = QPushButton("\u25B6  Run")
-        self.run_button.clicked.connect(
-            lambda: self.run_requested.emit(self.input.text().strip())
+        self.send_button.setToolTip(
+            "Ask the planner. If your message is a build/fix request it "
+            "dispatches the workers to do it \u2014 one click, no guessing."
         )
+        self.send_button.clicked.connect(self._on_send)
+        self.command_button = QPushButton("\u2318 Command")
+        self.command_button.setObjectName("thinkToggle")
+        self.command_button.setToolTip(
+            "Run a terminal command on your PC from here (e.g. pytest, python "
+            "app.py, pip install -r requirements.txt). You are asked first."
+        )
+        self.command_button.clicked.connect(self._toggle_command_mode)
+
         input_row.addWidget(self.input, stretch=1)
-        input_row.addWidget(self.project_input)
+        input_row.addWidget(self.command_button)
         input_row.addWidget(self.send_button)
-        input_row.addWidget(self.run_button)
         root.addLayout(input_row)
+
+        helper = QLabel(
+            "Send = the planner answers (and builds it if you asked for that) "
+            "\u00B7 @ = attach a file to the message \u00B7 \u2318 Command = run a "
+            "terminal command \u00B7 drag over any text to copy \u00B7 Ctrl +/- "
+            "zooms this chat"
+        )
+        helper.setObjectName("hintLabel")
+        helper.setWordWrap(True)
+        helper.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        root.addWidget(helper)
 
         self.refresh_roles()
         self.append_system(
-            "Chat is live \u2014 pick a role above and talk to the model. "
-            "Planner plans everything; workers execute. Press Run to hand "
-            "your message to the full agent pipeline."
+            "Welcome to AquilaOS. Chat normally \u2014 you don't need perfect "
+            "prompts. Ask the planner anything; if you want something built or "
+            "fixed it plans it and the worker agents write the files, which then "
+            "open in the code column (middle)."
+        )
+        self.set_ready(False)
+
+    # ---------------- file tagging (@file) ---------------- #
+
+    def _setup_tag_completer(self):
+        """Type @ to pick a file; the model then receives its path+contents."""
+        self._tag_model = QStringListModel(self)
+        completer = QCompleter(self._tag_model, self)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setCompletionMode(QCompleter.CompletionMode.PopupCompletion)
+        completer.setFilterMode(Qt.MatchFlag.MatchContains)
+        self.input.setCompleter(completer)
+        self._completer = completer
+        self.input.textEdited.connect(self._refresh_tag_model)
+
+    def refresh_tag_model(self):
+        """File suggestions = everything in the projects folder + any file
+        that is already open in the coding center."""
+        names = []
+        root = getattr(self, "project_root", "") or ""
+        if root and os.path.isdir(root):
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = [d for d in dirnames
+                               if d not in ("__pycache__", ".git", "node_modules")]
+                for name in filenames:
+                    full = os.path.join(dirpath, name)
+                    names.append(os.path.relpath(full, root).replace("\\", "/"))
+                if len(names) > 4000:
+                    break
+        if self.workspace_tabs is not None:
+            for rel in self.workspace_tabs.open_paths():
+                if rel not in names:
+                    names.append(rel)
+        self._tag_model.setStringList(sorted(names)[:4000])
+
+    def _refresh_tag_model(self, text: str):
+        if "@" in text:
+            self.refresh_tag_model()
+
+    def tagged_paths(self) -> list[str]:
+        """Absolute paths referenced with @token in the current input."""
+        out = []
+        tokens = re.findall(r"@([^\s]+)", self.input.text())
+        root = getattr(self, "project_root", "") or os.path.abspath(".")
+        for tok in tokens:
+            tok = tok.strip().rstrip(",.;:)")
+            candidate = tok if os.path.isabs(tok) else os.path.join(root, tok)
+            candidate = os.path.abspath(candidate)
+            if os.path.exists(candidate) and candidate not in out:
+                out.append(candidate)
+        return out
+
+    def _attachment_block(self, paths: list[str], limit_lines: int = 400) -> str:
+        """Build the prompt section that carries tagged files to the model."""
+        if not paths:
+            return ""
+        chunks = ["Attached files (use these as context and for edits):"]
+        for path in paths:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    body = "".join(f.readlines()[:limit_lines])
+            except OSError as e:
+                body = f"(could not read: {e})"
+            chunks.append(f"\n--- {path} ---\n{body}")
+        return "\n".join(chunks)
+
+    # ---------------- terminal / command mode ---------------- #
+
+    def _toggle_command_mode(self):
+        self.terminal_mode = not self.terminal_mode
+        if self.terminal_mode:
+            self.command_button.setObjectName("navButton")
+            self.command_button.setText("\u2318 Command \u00B7 ON")
+            self.input.setPlaceholderText(
+                "Terminal command \u2014 e.g. pytest -q   or   python app.py"
+            )
+        else:
+            self.command_button.setObjectName("thinkToggle")
+            self.command_button.setText("\u2318 Command")
+            self.input.setPlaceholderText(
+                "Type a message\u2026 prefix @ to attach a file"
+            )
+        # re-apply the stylesheet so the colour follows the object name
+        self.command_button.style().unpolish(self.command_button)
+        self.command_button.style().polish(self.command_button)
+
+    # ---------------- zoom ---------------- #
+
+    def apply_zoom(self, factor: float):
+        """Ctrl +/- zooms the conversation and bubbles in this panel."""
+        self._zoom = max(0.6, min(2.2, factor))
+        base = 13.0 * self._zoom
+        self.setStyleSheet(
+            f"QFrame#bubbleUser, QFrame#bubbleBot {{ font-size: {base:.1f}px; }}"
+            f"QLabel#chatSystem, QLabel#diffLine, QLabel#hintLabel {{ "
+            f"font-size: {max(8.0, base - 1.5):.1f}px; }}"
+            f"QFrame#chatHud QLabel {{ font-size: {max(8.0, base - 1.0):.1f}px; }}"
         )
 
-    # ---------------- messages ---------------- #
+    @staticmethod
+    def _selectable(widget: QWidget):
+        """Let the user drag-select and Ctrl+C from this widget."""
+        widget.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        return widget
+
+    def _attach_copy_menu(self, widget: QWidget, text_getter, label: str = "message"):
+        """Right-click -> Copy (plus copy-all) on any chat element."""
+        widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+
+        def _menu(pos):
+            menu = QMenu(widget)
+            menu.addAction(f"Copy {label}", lambda: self._to_clipboard(text_getter()))
+            menu.addAction("Copy whole chat", self.copy_chat)
+            menu.exec(widget.mapToGlobal(pos))
+
+        widget.customContextMenuRequested.connect(_menu)
+
+    @staticmethod
+    def _to_clipboard(text: str):
+        QApplication.clipboard().setText(text or "")
+
+    def copy_chat(self):
+        self._to_clipboard("\n".join(self._transcript))
+        self.append_system("\u29C9 Conversation copied to the clipboard.")
+
+    def _insert(self, widget: QWidget):
+        self.chat_layout.insertWidget(self.chat_layout.count() - 1, widget)
+        self._scroll_chat_bottom()
 
     def _append_bubble(self, who: str, text: str, mine: bool):
         wrap = QWidget()
@@ -624,8 +1008,9 @@ class ChatPanel(QWidget):
         name.setObjectName("bubbleNameMine" if mine else "bubbleName")
         body = QLabel(text)
         body.setWordWrap(True)
-        body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         body.setMaximumWidth(520)
+        self._selectable(name)
+        self._selectable(body)
         inner.addWidget(name)
         inner.addWidget(body)
 
@@ -635,17 +1020,85 @@ class ChatPanel(QWidget):
         else:
             row.addWidget(bubble)
             row.addStretch(1)
-        # insert before the trailing stretch so messages stack top-down
-        self.chat_layout.insertWidget(self.chat_layout.count() - 1, wrap)
-        self._scroll_chat_bottom()
+        # right-click copies just this message
+        self._attach_copy_menu(bubble, lambda: f"{who}: {text}")
+        self._transcript.append(f"{who}: {text}")
+        self._insert(wrap)
 
     def append_system(self, text: str):
         lbl = QLabel(text)
         lbl.setObjectName("chatSystem")
         lbl.setWordWrap(True)
         lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.chat_layout.insertWidget(self.chat_layout.count() - 1, lbl)
-        self._scroll_chat_bottom()
+        self._selectable(lbl)
+        self._attach_copy_menu(lbl, lambda: text, "line")
+        self._transcript.append(f"-- {text}")
+        self._insert(lbl)
+
+    def append_diff_line(self, path: str, added: int, removed: int):
+        """Per-file '+12 / -2' line, green added / red removed."""
+        lbl = QLabel(
+            f'<span style="color:#8b93a7">{html_escape(os.path.basename(path))}'
+            f'</span>&nbsp;&nbsp;<span style="color:#3fb950; font-weight:700">'
+            f'+{added}</span>&nbsp;<span style="color:#f85149; font-weight:700">'
+            f'\u2212{removed}</span>'
+        )
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setObjectName("diffLine")
+        self._selectable(lbl)
+        self._transcript.append(f"{path}: +{added} -{removed}")
+        self._insert(lbl)
+
+    def append_thinking(self, stage: str, title: str, detail: str):
+        """One compact line per thinking step (planner plan, worker task,
+        review verdict, re-prompt). Click the line to read the full content;
+        the whole stream is hidden when the Think toggle is off."""
+        row = QWidget()
+        box = QVBoxLayout(row)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(0)
+
+        header = QPushButton(f"\U0001F9E0 {stage} \u00B7 {title}   \u25B8")
+        header.setObjectName("thinkLine")
+        header.setCheckable(True)
+        body = QLabel(detail or "(no detail)")
+        body.setObjectName("thinkBody")
+        body.setWordWrap(True)
+        body.setVisible(False)
+        self._selectable(body)
+        header.toggled.connect(
+            lambda on, b=body, h=header, t=title: (
+                b.setVisible(on),
+                h.setText(f"\U0001F9E0 {stage} \u00B7 {t}   "
+                          + ("\u25BE" if on else "\u25B8")),
+            )
+        )
+        box.addWidget(header)
+        box.addWidget(body)
+
+        self._attach_copy_menu(row, lambda: f"{stage}: {title}\n{detail}")
+        self._transcript.append(f"[think] {stage}: {title}")
+        self._thinking_cards.append(row)
+        row.setVisible(self.think_button.isChecked())
+        self._insert(row)
+
+    def append_terminal(self, command: str, output: str, ok: bool):
+        """Show a terminal command + its output (copyable, monospace)."""
+        color = "#3fb950" if ok else "#f85149"
+        mark = "\u2713" if ok else "\u2717"
+        body = f"{mark} $ {command}\n{output or '(no output)'}"
+        lbl = QLabel(body)
+        lbl.setObjectName("terminalLine")
+        lbl.setWordWrap(True)
+        self._selectable(lbl)
+        self._attach_copy_menu(lbl, lambda: body, "terminal output")
+        self._transcript.append(body)
+        self._insert(lbl)
+        self.hud_dot.setStyleSheet(f"color: {color};")
+
+    def _on_think_toggled(self, on: bool):
+        for card in self._thinking_cards:
+            card.setVisible(on)
 
     def _scroll_chat_bottom(self):
         bar = self.chat_scroll.verticalScrollBar()
@@ -653,6 +1106,67 @@ class ChatPanel(QWidget):
 
     def append_user(self, text: str):
         self._append_bubble("You", text, mine=True)
+
+    # ---------------- ready state / HUD ---------------- #
+
+    def set_ready(self, ready: bool):
+        """Chat only works once a projects folder has been chosen."""
+        self._ready = ready
+        self.input.setEnabled(ready)
+        self.send_button.setEnabled(ready)
+        if ready:
+            self.input.setPlaceholderText(
+                "Terminal command \u2014 e.g. pytest -q   or   python app.py"
+                if self.terminal_mode
+                else "Type a message\u2026 prefix @ to attach a file"
+            )
+            self.set_idle("Ready")
+        else:
+            self.input.setPlaceholderText(
+                "Choose a projects folder first (\U0001F4C2 Folder\u2026)"
+            )
+            self.set_idle(
+                "No projects folder selected \u2014 click \U0001F4C2 Folder\u2026 "
+                "to pick where projects are created or opened."
+            )
+
+    def set_activity(self, text: str):
+        """HUD: what is happening right now (animated dots while active)."""
+        self._hud_base = text
+        self._hud_dots = 0
+        self.hud_activity.setText(text)
+        self.hud_dot.setStyleSheet("color: #7c5cff;")
+        if text:
+            self._hud_timer.start()
+        else:
+            self._hud_timer.stop()
+
+    def set_idle(self, text: str = "Idle"):
+        self._hud_timer.stop()
+        self._hud_base = text
+        self.hud_activity.setText(text)
+        self.hud_dot.setStyleSheet("color: #3fb950;")
+
+    def _tick_hud(self):
+        self._hud_dots = (self._hud_dots + 1) % 4
+        self.hud_activity.setText(self._hud_base + "." * self._hud_dots)
+
+    def reset_run_hud(self):
+        self._added = 0
+        self._removed = 0
+        self._refresh_diff()
+
+    def add_diff(self, path: str, added: int, removed: int):
+        self._added += added
+        self._removed += removed
+        self._refresh_diff()
+        self.append_diff_line(path, added, removed)
+
+    def _refresh_diff(self):
+        self.hud_diff.setText(
+            f'<span style="color:#3fb950">+{self._added}</span>'
+            f'&nbsp;&nbsp;<span style="color:#f85149">\u2212{self._removed}</span>'
+        )
 
     # ---------------- role / model selection ---------------- #
 
@@ -695,14 +1209,38 @@ class ChatPanel(QWidget):
     # ---------------- send ---------------- #
 
     def _on_send(self):
+        if not self._ready:
+            self.append_system(
+                "\U0001F4C2 Choose a projects folder first (Folder\u2026) \u2014 "
+                "then chat and commands work inside it."
+            )
+            return
         text = self.input.text().strip()
         if not text or self._busy:
             return
+
+        # ---- terminal mode: hand the command to the dashboard runner ----
+        if self.terminal_mode:
+            tags = self.tagged_paths()
+            self.append_system(f"\u2318 {text}")
+            self.input.clear()
+            self.set_activity("Running command")
+            self.command_requested.emit(text, tags)
+            return
+
+        # ---- normal chat: attach any @tagged files to the prompt ----
+        tags = self.tagged_paths()
+        self.last_tagged = list(tags)
         self.input.clear()
         role = self.role_combo.currentData() or "planner"
         spec = dict(getattr(self.config, role, {}) or {})
         self.append_user(text)
+        if tags:
+            shown = ", ".join(os.path.basename(p) for p in tags[:6])
+            self.append_system(f"\U0001F4CE Attached to the message: {shown}")
+        prompt = text + ("\n\n" + self._attachment_block(tags) if tags else "")
         self.append_system(f"\u2192 {role} is thinking\u2026")
+        self.set_activity(f"{role.capitalize()} is thinking")
         warning = self._planner_model_warning()
         if warning and not self._warned_about_model:
             self._warned_about_model = True
@@ -711,7 +1249,7 @@ class ChatPanel(QWidget):
         self._busy = True
         self.send_button.setEnabled(False)
         self._thread = QThread()
-        self._worker = ChatWorker(role, spec, text)
+        self._worker = ChatWorker(role, spec, prompt)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.reply.connect(self._on_reply)
@@ -722,8 +1260,9 @@ class ChatPanel(QWidget):
 
     def _on_reply(self, text: str, model: str):
         self._busy = False
-        self.send_button.setEnabled(True)
+        self.send_button.setEnabled(self._ready)
         role = self.role_combo.currentData() or "planner"
+        self.set_idle("Ready")
         text = (text or "").strip()
 
         # The planner marks actionable goals with [[DISPATCH]] -- casual
@@ -747,103 +1286,574 @@ class ChatPanel(QWidget):
             self.run_requested.emit(goal)
         elif had_code:
             self.append_system(
-                "Code stays out of the chat \u2014 the workers write the "
-                "files during a run. Press \u25B6 Run to dispatch the goal."
-            )
+            "Code stays out of the chat \u2014 the workers write the files "
+            "during a build. Ask the planner to build it and it dispatches "
+            "the workers itself."
+        )
 
     def _on_chat_failed(self, error: str):
         self._busy = False
-        self.send_button.setEnabled(True)
-        self.append_system(f"\u26A0 Chat error: {error}")
+        self.send_button.setEnabled(self._ready)
+        self.set_idle("Chat error")
+        self.append_system(f"\u26A0 Chat error (right-click to copy): {error}")
 
 
 # --------------------------------------------------------------------- #
-# Folder section: workspace tree + code viewer (click a file -> read it)
+# Code center: VS Code-like editor -- tabs, line numbers, colors.
 # --------------------------------------------------------------------- #
 
-class FilesPanel(QWidget):
-    """Folder tree of the generated workspace with a code viewer.
+class LineNumberArea(QWidget):
+    """Paints the gutter with line numbers 1..N, synced to the editor."""
 
-    Used on the left of Home (compact) and as the full Files section --
-    click any file the models created to see exactly what code was written
-    inside it.
-    """
+    def __init__(self, editor):
+        super().__init__(editor)
+        self._editor = editor
 
-    def __init__(self, root_path: str, compact: bool = True, parent=None):
+    def paintEvent(self, event):
+        self._editor.line_number_paint_event(event)
+
+
+class PythonHighlighter(QSyntaxHighlighter):
+    """Lightweight Python syntax coloring for the code center."""
+
+    _KEYWORDS = {
+        "def", "class", "return", "import", "from", "if", "elif", "else",
+        "for", "while", "try", "except", "finally", "with", "as", "raise",
+        "pass", "break", "continue", "lambda", "yield", "assert", "del",
+        "global", "nonlocal", "in", "is", "not", "and", "or", "True",
+        "False", "None", "async", "await",
+    }
+    _BUILTINS = {
+        "print", "len", "range", "open", "str", "int", "float", "list",
+        "dict", "set", "tuple", "super", "self", "isinstance", "type",
+        "repr", "enumerate", "zip", "map", "filter", "sorted", "sum",
+        "min", "max", "abs", "Exception",
+    }
+
+    def _fmt(self, color: str, bold: bool = False) -> QTextCharFormat:
+        fmt = QTextCharFormat()
+        fmt.setForeground(QColor(color))
+        if bold:
+            fmt.setFontWeight(QFont.Weight.Bold)
+        return fmt
+
+    def highlightBlock(self, text: str):
+        keyword = self._fmt("#c678dd")
+        builtin = self._fmt("#61afef")
+        string = self._fmt("#98c379")
+        comment = self._fmt("#5c6370")
+        number = self._fmt("#d19a66")
+        decorator = self._fmt("#c678dd")
+
+        in_string = self.previousBlockState() == 1
+        span_start = 0 if in_string else None
+
+        tokens = re.findall(r'("[^"]*"|\'[^\']*\'|#[^\n]*|\w+|\d[\w.]*|\S)', text)
+        pos = 0
+        for tok in tokens:
+            start = text.find(tok, pos)
+            if start < 0:
+                continue
+            end = start + len(tok)
+            pos = end
+            if tok.startswith("#"):
+                self.setFormat(start, end - start, comment)
+                break
+            if (tok.startswith('"') or tok.startswith("'")) and len(tok) >= 2:
+                self.setFormat(start, end - start, string)
+                continue
+            if tok.startswith("@"):
+                self.setFormat(start, end - start, decorator)
+                continue
+            if tok in self._KEYWORDS:
+                self.setFormat(start, end - start, keyword)
+            elif tok in self._BUILTINS:
+                self.setFormat(start, end - start, builtin)
+            elif tok[:1].isdigit():
+                self.setFormat(start, end - start, number)
+
+        if in_string and span_start is not None:
+            self.setCurrentBlockState(0)
+        else:
+            self.setCurrentBlockState(0)
+
+
+class CodeEditor(QPlainTextEdit):
+    """Read-only code page with a live 1..N line-number gutter."""
+
+    def __init__(self, parent=None):
         super().__init__(parent)
-        self.fs_model = QFileSystemModel(self)
-        self.fs_model.setRootPath(root_path)
+        self.setObjectName("codeView")
+        self.setReadOnly(True)
+        self.setMinimumWidth(0)
+        self.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        self._line_area = LineNumberArea(self)
+        self.blockCountChanged.connect(self.update_line_area_width)
+        self.updateRequest.connect(self.update_line_area)
+        self.update_line_area_width(0)
+        # keep a reference so the highlighter is not garbage-collected
+        self._highlighter = PythonHighlighter(self.document())
+
+    def line_number_area_width(self) -> int:
+        digits = max(2, len(str(max(1, self.blockCount()))))
+        return 14 + QFontMetrics(self.font()).horizontalAdvance("9") * digits
+
+    def update_line_area_width(self, _):
+        self.setViewportMargins(self.line_number_area_width(), 0, 0, 0)
+
+    def update_line_area(self, rect, dy):
+        if dy:
+            self._line_area.scroll(0, dy)
+        else:
+            self._line_area.update(
+                0, rect.y(), self._line_area.width(), rect.height()
+            )
+        if rect.contains(self.viewport().rect()):
+            self.update_line_area_width(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        rect = self.contentsRect()
+        self._line_area.setGeometry(rect.left(), rect.top(),
+                                    self.line_number_area_width(),
+                                    rect.height())
+
+    def line_number_paint_event(self, event):
+        painter = QPainter(self._line_area)
+        painter.fillRect(event.rect(), QColor("#0a0c12"))
+        painter.setPen(QColor("#5b6172"))
+        block = self.firstVisibleBlock()
+        block_number = block.blockNumber()
+        top = round(self.blockBoundingGeometry(block)
+                    .translated(self.contentOffset()).top())
+        bottom = top + round(self.blockBoundingRect(block).height())
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                painter.drawText(0, top, self._line_area.width() - 8,
+                                 painter.fontMetrics().height(),
+                                 Qt.AlignmentFlag.AlignRight,
+                                 str(block_number + 1))
+            block = block.next()
+            top = bottom
+            bottom = top + round(self.blockBoundingRect(block).height())
+            block_number += 1
+
+
+# --------------------------------------------------------------------- #
+# Coding center: VS Code-like editor column -- tabs in the middle.
+#
+# Lives in the MIDDLE column of Home. Tabs open when you click a file on
+# the left, and they also open by themselves whenever a worker model
+# writes a file -- that is how you watch the code appear live.
+# --------------------------------------------------------------------- #
+
+class WorkspaceTabs(QWidget):
+    """The coding center: one tab per open file, each with line numbers
+    1..N in the gutter and Python colors. Tab titles shrink to fit so the
+    chat on the right is never pushed around. When the last tab closes the
+    whole column hides and the chat takes the space back."""
+
+    tabs_changed = pyqtSignal(int)   # number of open tabs (0 -> hide column)
+    file_saved = pyqtSignal(str)     # path written by Ctrl+S
+
+    def __init__(self, project_root: str, parent=None):
+        super().__init__(parent)
+        self.project_root = os.path.abspath(project_root)
+        self.project_root_cfg = project_root
+        self._open: dict[str, CodeEditor] = {}
+        self._zoom = 1.0
+        self._dirty: set[str] = set()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
+        self.setMinimumWidth(340)
 
         head = QHBoxLayout()
         head.setSpacing(8)
-        title = QLabel("\U0001F4C1  Files")
+        title = QLabel("\U0001F4BB  Code")
         title.setObjectName("panelTitle")
         head.addWidget(title)
         head.addStretch(1)
-        self.path_chip = QLabel("\u2014")
-        self.path_chip.setObjectName("pathChip")
-        head.addWidget(self.path_chip)
+        self.project_label = QLabel("")
+        self.project_label.setObjectName("hintLabel")
+        self.project_label.setMaximumWidth(260)
+        head.addWidget(self.project_label)
         layout.addLayout(head)
 
-        split = QSplitter(Qt.Orientation.Vertical)
+        # kept for status text; the open-file count lives in the left
+        # column's "Open files" card so nothing crowds the chat header
+        self.status_label = QLabel("no file open")
+        self.status_label.setVisible(False)
+
+        self.tabs = QTabWidget()
+        self.tabs.setObjectName("codeTabs")
+        self.tabs.setTabsClosable(False)
+        self.tabs.tabBar().setObjectName("codeTabBar")
+        self.tabs.tabBar().setElideMode(Qt.TextElideMode.ElideRight)
+        self.tabs.tabBar().setUsesScrollButtons(True)
+        self.tabs.tabBar().setDrawBase(False)
+        self.tabs.setDocumentMode(False)
+        self.tabs.setMovable(False)
+        self.tabs.setTabPosition(QTabWidget.TabPosition.North)
+        layout.addWidget(self.tabs, stretch=1)
+
+        # shown only when no tab is open -- the column never looks broken
+        self.empty_label = QLabel("No file open yet \u2014 click a file on the left,\n"
+                                  "or press \u25B6 Run \u00B7 build and watch the\n"
+                                  "workers' code open here by itself.")
+        self.empty_label.setObjectName("hintLabel")
+        self.empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_label.setWordWrap(True)
+        layout.addWidget(self.empty_label, stretch=1)
+        self._sync_empty()
+
+    # ---------------- project root ---------------- #
+
+    def set_project_root(self, path: str):
+        self.project_root = os.path.abspath(path)
+        self.project_label.setText(f"project: {os.path.basename(self.project_root)}")
+        self.project_label.setToolTip(self.project_root)
+        self.close_all()
+
+    def close_all(self):
+        self.tabs.clear()
+        self._open = {}
+        self.status_label.setText("no file open")
+        self._sync_empty()
+
+    def _sync_empty(self):
+        empty = self.tabs.count() == 0
+        self.empty_label.setVisible(empty)
+        self.tabs.setVisible(not empty)
+        self.tabs_changed.emit(self.tabs.count())
+
+    def open_paths(self) -> list[str]:
+        """Project-relative paths of the open tabs, in tab order."""
+        out = []
+        for i in range(self.tabs.count()):
+            full = self.tabs.tabBar().tabData(i)
+            if not full:
+                continue
+            try:
+                out.append(os.path.relpath(full, self.project_root))
+            except ValueError:
+                out.append(os.path.basename(full))
+        return out
+
+    # ---------------- opening files ---------------- #
+
+    def _short_title(self, rel: str) -> str:
+        shown = rel.replace("\\", "/")
+        if len(shown) > 34:
+            return "\u2026" + shown[-33:]
+        return shown
+
+    def _load_text(self, full_path: str) -> str:
+        if os.path.getsize(full_path) > 1_000_000:
+            return "(file larger than 1 MB -- not shown)"
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                return f.read()
+        except OSError as e:
+            return f"(could not read file: {e})"
+
+    def open_file(self, full_path: str):
+        """Open a file tab (or jump to it / refresh it if already open)."""
+        full_path = os.path.abspath(full_path)
+        if full_path in self._open:
+            self.refresh_file(full_path)
+            self.tabs.setCurrentWidget(self._open[full_path])
+            return
+
+        editor = CodeEditor(self)
+        editor.setPlainText(self._load_text(full_path))
+        editor.setReadOnly(False)          # editable: fix things by hand
+        editor.document().modificationChanged.connect(
+            lambda changed, p=full_path: self._on_modified(p, changed)
+        )
+        try:
+            rel = os.path.relpath(full_path, self.project_root)
+        except ValueError:
+            rel = os.path.basename(full_path)
+
+        tab_index = self.tabs.addTab(editor, self._short_title(rel))
+        self.tabs.tabBar().setTabData(tab_index, full_path)
+        # little x close button inside the tab title
+        close = QPushButton("\u00D7")
+        close.setObjectName("tabClose")
+        close.setFixedSize(20, 20)
+        close.setCursor(Qt.CursorShape.PointingHandCursor)
+        close.setToolTip(f"Close {rel}")
+        close.clicked.connect(lambda _=False, p=full_path: self.close_file(p))
+        self.tabs.tabBar().setTabButton(tab_index, QTabBar.ButtonPosition.RightSide, close)
+        self.tabs.setTabToolTip(tab_index, rel)
+
+        self._open[full_path] = editor
+        self.tabs.setCurrentWidget(editor)
+        self.status_label.setText(f"{len(self._open)} file(s) open")
+        self._sync_empty()
+
+    def refresh_file(self, full_path: str):
+        """Reload the text of an already-open tab (live run watching).
+        Never clobbers edits the user has not saved yet."""
+        full_path = os.path.abspath(full_path)
+        editor = self._open.get(full_path)
+        if editor is None or full_path in self._dirty:
+            return
+        text = editor.toPlainText()
+        fresh = self._load_text(full_path)
+        if fresh != text:
+            editor.setPlainText(fresh)
+
+    # ---------------- editing / saving ---------------- #
+
+    def _on_modified(self, full_path: str, changed: bool):
+        if changed:
+            self._dirty.add(full_path)
+        else:
+            self._dirty.discard(full_path)
+        self._mark_dirty_tab(full_path)
+
+    def _mark_dirty_tab(self, full_path: str):
+        editor = self._open.get(full_path)
+        index = self.tabs.indexOf(editor) if editor else -1
+        if index < 0:
+            return
+        base = self.tabs.tabText(index).lstrip("\u25CF ").strip()
+        dirty = full_path in self._dirty
+        try:
+            rel = os.path.relpath(full_path, self.project_root)
+        except ValueError:
+            rel = base
+        self.tabs.setTabText(index, ("\u25CF " if dirty else "") + self._short_title(rel))
+
+    def save_current(self) -> bool:
+        """Ctrl+S -- write the current tab back to disk."""
+        editor = self.tabs.currentWidget()
+        if not isinstance(editor, CodeEditor):
+            return False
+        return self.save_file(self._path_of(editor))
+
+    def _path_of(self, editor) -> str:
+        for path, ed in self._open.items():
+            if ed is editor:
+                return path
+        return ""
+
+    def save_file(self, full_path: str) -> bool:
+        editor = self._open.get(os.path.abspath(full_path))
+        if editor is None:
+            return False
+        try:
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(editor.toPlainText())
+        except OSError as e:
+            self.status_label.setText(f"save failed: {e}")
+            return False
+        self._dirty.discard(os.path.abspath(full_path))
+        editor.document().setModified(False)
+        self._mark_dirty_tab(os.path.abspath(full_path))
+        self.status_label.setText(f"saved {os.path.basename(full_path)}")
+        self.file_saved.emit(full_path)
+        return True
+
+    def save_all(self) -> int:
+        return sum(1 for p in list(self._dirty) if self.save_file(p))
+
+    # ---------------- zoom ---------------- #
+
+    def apply_zoom(self, factor: float):
+        """Ctrl +/- zooms the code text in every open tab."""
+        self._zoom = max(0.6, min(2.2, factor))
+        size = 12.5 * self._zoom
+        for editor in self._open.values():
+            font = editor.font()
+            font.setPointSizeF(max(7.5, size - 1.5))
+            editor.setFont(font)
+
+    def close_file(self, full_path: str):
+        full_path = os.path.abspath(full_path)
+        editor = self._open.pop(full_path, None)
+        if editor is None:
+            return
+        index = self.tabs.indexOf(editor)
+        if index >= 0:
+            self.tabs.removeTab(index)
+        editor.deleteLater()
+        self.status_label.setText(
+            f"{len(self._open)} file(s) open" if self._open else "no file open")
+        self._sync_empty()
+        # tell the left column to refresh its "Open files" list
+        left = self.parent()
+        updater = getattr(self, "opened", None)
+        if callable(updater):
+            updater(self.open_paths())
+        elif left is not None and hasattr(left, "update_open_list"):
+            left.update_open_list(self.open_paths())
+
+    def auto_open(self, relative_path: str, root_path: str | None = None):
+        """A worker wrote this file -- open it so the user sees it. Only
+        files inside the current project root are opened, so chat never
+        moves for something out of scope."""
+        anchor = root_path or self.project_root
+        anchor = os.path.abspath(anchor)
+        if os.path.normcase(anchor) != os.path.normcase(self.project_root):
+            return  # out-of-scope write: never touches the coding center
+        full = os.path.normpath(os.path.join(root_path or self.project_root, relative_path))
+        if os.path.isdir(full) or not os.path.exists(full):
+            return
+        self.open_file(full)
+        if os.path.isdir(full) or not os.path.exists(full):
+            return
+        self.open_file(full)
+
+
+# --------------------------------------------------------------------- #
+# Folder section: left column (files top, open-files list bottom)
+# --------------------------------------------------------------------- #
+
+class FilesPanel(QWidget):
+    """Left column: files on top, the open coding-center tabs in the middle.
+
+    Clicking a file opens it in the coding center (tabs live there, so the
+    chat on the right is never squeezed). The panel also auto-opens files
+    the worker models are writing -- that is how the user sees "it open"
+    without clicking.
+    """
+
+    def __init__(self, root_path: str, parent=None):
+        super().__init__(parent)
+        self.root_path = root_path
+        self.workspace_tabs = None  # wired by the Dashboard
+
+        self.fs_model = QFileSystemModel(self)
+        self.fs_model.setRootPath(root_path)
+
+        self._watcher = QFileSystemWatcher(self)
+        self._watcher.fileChanged.connect(self._track_change)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+        self.setMinimumWidth(250)
+
+        # ---- upper card: the folder section ----
+        files_card = QFrame()
+        files_card.setObjectName("panelCard")
+        files_layout = QVBoxLayout(files_card)
+        files_layout.setContentsMargins(12, 10, 12, 12)
+        files_layout.setSpacing(8)
+
+        files_head = QHBoxLayout()
+        files_title = QLabel("\U0001F4C1  Files")
+        files_title.setObjectName("panelTitle")
+        files_head.addWidget(files_title)
+        self.code_toggle = QPushButton("\u25A4 Code")
+        self.code_toggle.setObjectName("thinkToggle")
+        self.code_toggle.setCheckable(True)
+        self.code_toggle.setChecked(True)
+        self.code_toggle.setToolTip(
+            "Show/hide the code column (middle). Closing every file hides it "
+            "automatically so the chat gets the whole space."
+        )
+        files_head.addWidget(self.code_toggle)
+        files_head.addStretch(1)
+        self.changed_label = QLabel("")
+        self.changed_label.setObjectName("hintLabel")
+        self.changed_label.setTextFormat(Qt.TextFormat.RichText)
+        files_head.addWidget(self.changed_label)
+        files_layout.addLayout(files_head)
+
         self.tree = QTreeView()
         self.tree.setModel(self.fs_model)
         self.tree.setRootIndex(self.fs_model.index(root_path))
         self.tree.setAnimated(True)
         self.tree.setIndentation(16)
-        if compact:
-            self.tree.setHeaderHidden(True)
-            for col in range(1, 4):
-                self.tree.setColumnHidden(col, True)
+        self.tree.setHeaderHidden(True)
+        for col in range(1, 4):
+            self.tree.setColumnHidden(col, True)
+        self.tree.setMinimumWidth(200)
         self.tree.clicked.connect(self._open_file)
-        split.addWidget(self.tree)
+        files_layout.addWidget(self.tree, stretch=1)
+        layout.addWidget(files_card, stretch=3)
 
-        self.code_view = QPlainTextEdit()
-        self.code_view.setObjectName("codeView")
-        self.code_view.setReadOnly(True)
-        self.code_view.setPlaceholderText(
-            "Click a file on the left to see the code the models wrote\u2026"
+        # ---- lower card: which files are open right now ----
+        open_card = QFrame()
+        open_card.setObjectName("panelCard")
+        open_layout = QVBoxLayout(open_card)
+        open_layout.setContentsMargins(12, 10, 12, 12)
+        open_layout.setSpacing(6)
+
+        open_title = QLabel("\U0001F4C4  Open files")
+        open_title.setObjectName("panelTitle")
+        self.open_title = open_title
+        open_layout.addWidget(open_title)
+
+        self.open_files_label = QLabel("No open files yet \u2014 click one above,\n"
+                                       "or wait for the workers to write one.")
+        self.open_files_label.setObjectName("hintLabel")
+        self.open_files_label.setWordWrap(True)
+        open_layout.addWidget(self.open_files_label)
+        open_layout.addStretch(1)
+        layout.addWidget(open_card, stretch=0)
+
+    # ---------------- helpers ---------------- #
+
+    def _elide(self, text: str, width: int = 230) -> str:
+        return QFontMetrics(self.path_chip.font()).elidedText(
+            text, Qt.TextElideMode.ElideMiddle, width
         )
-        if compact:
-            split.addWidget(self.code_view)
-            split.setSizes([240, 360])
-        else:
-            split.addWidget(self.code_view)
-            split.setSizes([320, 480])
-        split.setStretchFactor(0, 1)
-        split.setStretchFactor(1, 1)
-        layout.addWidget(split, stretch=1)
-
-        self.root_path = root_path
 
     def set_root(self, path: str):
-        """Point both tree and viewers at a new project root."""
+        """Point the tree and the coding center at a new project root."""
         self.root_path = path
         self.fs_model.setRootPath(path)
         self.tree.setRootIndex(self.fs_model.index(path))
+        if self.workspace_tabs is not None:
+            self.workspace_tabs.set_project_root(path)
+
+    def mark_changed(self, added: int, removed: int):
+        """Show '+12 / -2' for the most recent write, next to the title."""
+        self.changed_label.setText(
+            f'<span style="color:#3fb950">+{added}</span> '
+            f'<span style="color:#f85149">\u2212{removed}</span>'
+        )
+
+    def update_open_list(self, paths: list[str]):
+        """List which files are currently open in the coding center."""
+        self.open_title.setText(
+            f"\U0001F4C4  Open files ({len(paths)})" if paths else "\U0001F4C4  Open files"
+        )
+        if not paths:
+            self.open_files_label.setText("No open files yet \u2014 click one above,\n"
+                                          "or wait for the workers to write one.")
+            return
+        self.open_files_label.setText("\n".join(f"\u2022 {p}" for p in paths[:8]))
 
     def _open_file(self, index):
         if not index.isValid() or self.fs_model.isDir(index):
             return
         path = self.fs_model.filePath(index)
-        try:
-            if os.path.getsize(path) > 1_000_000:
-                self.code_view.setPlainText("(file larger than 1 MB -- not shown)")
-                self.path_chip.setText(os.path.basename(path))
-                return
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except OSError as e:
-            content = f"(could not read file: {e})"
-        self.code_view.setPlainText(content)
-        try:
-            self.path_chip.setText(os.path.relpath(path, self.root_path))
-        except ValueError:
-            self.path_chip.setText(os.path.basename(path))
+        if self.workspace_tabs is not None:
+            self.workspace_tabs.open_file(path)
+            self.update_open_list(self.workspace_tabs.open_paths())
+        self._watch_if_new(path)
+        self._watch_if_new(path)
+
+    def _watch_if_new(self, path: str):
+        """Follow a path while the run is writing it so open tabs refresh."""
+        if os.path.exists(path) and path not in self._watcher.files():
+            self._watcher.addPath(path)
+
+    def _track_change(self, path: str):
+        """A watched file changed on disk -> refresh its tab if open, so the
+        user watches the code change live while workers are writing."""
+        if self.workspace_tabs is not None:
+            self.workspace_tabs.refresh_file(path)
 
 
 # --------------------------------------------------------------------- #
@@ -1154,6 +2164,34 @@ class SettingsDialog(QDialog):
         )
         self.review_check.setChecked(getattr(config, "planner_review", True))
         general_form.addRow("", self.review_check)
+
+        self.pc_access_check = QCheckBox(
+            "Allow the agents to read/write files anywhere on this PC"
+        )
+        self.pc_access_check.setChecked(getattr(config, "allow_pc_access", False))
+        self.pc_access_check.setToolTip(
+            "Off by default: the agents stay inside your projects folder plus any "
+            "file you tag with @ in the chat."
+        )
+        general_form.addRow("", self.pc_access_check)
+
+        self.confirm_commands_check = QCheckBox(
+            "Ask me before the agent runs a terminal command"
+        )
+        self.confirm_commands_check.setChecked(
+            getattr(config, "confirm_commands", True)
+        )
+        general_form.addRow("", self.confirm_commands_check)
+
+        self.test_command_edit = QLineEdit(getattr(config, "test_command", "") or "")
+        self.test_command_edit.setPlaceholderText(
+            'e.g. python -m pytest -q  (empty = skip)'
+        )
+        self.test_command_edit.setToolTip(
+            "After every run the platform executes this command in a terminal "
+            "inside the generated project, so you see whether it actually works."
+        )
+        general_form.addRow("Test command", self.test_command_edit)
         body.addWidget(general_box)
 
         test_card = QGroupBox("")
@@ -1206,6 +2244,9 @@ class SettingsDialog(QDialog):
             "max_repair": self.max_repair_spin.value(),
             "workspace": self.workspace_edit.text().strip(),
             "review": self.review_check.isChecked(),
+            "pc_access": self.pc_access_check.isChecked(),
+            "confirm_commands": self.confirm_commands_check.isChecked(),
+            "test_command": self.test_command_edit.text().strip(),
         }
 
     def reject(self):
@@ -1260,6 +2301,9 @@ class SettingsDialog(QDialog):
         self.config.max_repair_attempts = self.max_repair_spin.value()
         self.config.workspace_dir = self.workspace_edit.text().strip() or "workspace"
         self.config.planner_review = self.review_check.isChecked()
+        self.config.allow_pc_access = self.pc_access_check.isChecked()
+        self.config.confirm_commands = self.confirm_commands_check.isChecked()
+        self.config.test_command = self.test_command_edit.text().strip()
         try:
             path = self.config.save()
         except Exception as e:
@@ -1273,18 +2317,150 @@ class SettingsDialog(QDialog):
 # Main window
 # --------------------------------------------------------------------- #
 
+class WelcomeDialog(QDialog):
+    """First-run gate: choose the folder where projects live.
+
+    Nothing can be built or shown before a folder exists, so the chat stays
+    disabled until this is answered (it can be changed later with the
+    \U0001F4C2 Folder\u2026 button in the chat or in Settings).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Welcome to AquilaOS")
+        self.setMinimumWidth(580)
+        self.chosen_path = ""
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(26, 24, 26, 20)
+        outer.setSpacing(14)
+
+        title = QLabel("Welcome to AquilaOS")
+        title.setObjectName("headerTitle")
+        outer.addWidget(title)
+
+        intro = QLabel(
+            "First, choose the folder where your projects live.\n\n"
+            "The agents create and edit files inside it, the Files panel "
+            "shows them, and the chat works on them. You can change it any "
+            "time with \U0001F4C2 Folder\u2026 in the chat or in Settings."
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("hintLabel")
+        intro.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        outer.addWidget(intro)
+
+        row = QHBoxLayout()
+        self.path_label = QLabel("No folder chosen yet")
+        self.path_label.setObjectName("pathChip")
+        row.addWidget(self.path_label, stretch=1)
+        pick = QPushButton("\U0001F4C2  Choose projects folder\u2026")
+        pick.setObjectName("primaryButton")
+        pick.clicked.connect(self._pick)
+        row.addWidget(pick)
+        outer.addLayout(row)
+
+        row2 = QHBoxLayout()
+        use_default = QPushButton("Use default (workspace/)")
+        use_default.clicked.connect(self._use_default)
+        row2.addWidget(use_default)
+        row2.addStretch(1)
+        self.continue_button = QPushButton("Continue")
+        self.continue_button.setObjectName("primaryButton")
+        self.continue_button.setEnabled(False)
+        self.continue_button.clicked.connect(self.accept)
+        row2.addWidget(self.continue_button)
+        outer.addLayout(row2)
+
+    def _pick(self):
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Choose the folder where projects live",
+            os.path.expanduser("~"),
+        )
+        if chosen:
+            self.chosen_path = chosen
+            self.path_label.setText(chosen)
+            self.path_label.setToolTip(chosen)
+            self.continue_button.setEnabled(True)
+
+    def _use_default(self):
+        self.chosen_path = os.path.abspath("workspace")
+        self.path_label.setText(self.chosen_path + "   (default)")
+        self.continue_button.setEnabled(True)
+
+
 class Dashboard(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("AgentOS - Autonomous Agent Platform (Phase 3 Dashboard)")
-        self.resize(1300, 850)
+        self.setWindowTitle("AquilaOS - Autonomous Agent Platform")
+        self.ui_state = load_ui_state()
+        self.ui_zoom = float(self.ui_state.get("zoom", 1.0) or 1.0)
         self.config = AgentOSConfig.load()
         self.thread = None
         self.worker = None
         self.action_rows = {}
+        self._terminal_tools = None
 
         self._build_ui()
         self._apply_theme()
+        self._restore_window()
+        self._install_shortcuts()
+        self.chat_panel.apply_zoom(self.ui_zoom)
+        self.home_tabs.apply_zoom(self.ui_zoom)
+        # First run: ask for the projects folder before chat becomes usable.
+        QTimer.singleShot(0, self._first_run_check)
+
+    # ---------------- layout that adapts to every screen ---------------- #
+
+    def _restore_window(self):
+        """Restore the window to last session's size, clamped to the screen
+        that is actually in use (monitors differ; splitting a screen must
+        never push the chat out of view)."""
+        screen = self.screen() or QApplication.primaryScreen()
+        area = screen.availableGeometry() if screen else None
+        geo = self.ui_state.get("geometry") or []
+        if isinstance(geo, list) and len(geo) == 4:
+            x, y, w, h = (int(v) for v in geo)
+            if area:
+                w = min(w, area.width())
+                h = min(h, area.height())
+                x = min(max(x, area.left()), area.right() - w)
+                y = min(max(y, area.top()), area.bottom() - h)
+            self.setGeometry(x, y, max(w, 900), max(h, 600))
+        else:
+            if area:
+                self.resize(min(1400, area.width() - 40),
+                            min(900, area.height() - 60))
+            else:
+                self.resize(1300, 850)
+
+    def _save_ui_state(self):
+        geo = self.geometry()
+        state = {
+            "geometry": [geo.x(), geo.y(), geo.width(), geo.height()],
+            "splitter": self.home_split.sizes() if hasattr(self, "home_split") else [],
+            "zoom": getattr(self, "ui_zoom", 1.0),
+        }
+        save_ui_state(state)
+
+    def closeEvent(self, event):
+        self._save_ui_state()
+        super().closeEvent(event)
+
+    def _install_shortcuts(self):
+        """Ctrl +/- zoom the chat and code, Ctrl+0 resets, Ctrl+S saves the
+        current code tab. Works the same on every screen size."""
+        QShortcut(QKeySequence("Ctrl+="), self, lambda: self._set_zoom(0.1))
+        QShortcut(QKeySequence("Ctrl++"), self, lambda: self._set_zoom(0.1))
+        QShortcut(QKeySequence("Ctrl+-"), self, lambda: self._set_zoom(-0.1))
+        QShortcut(QKeySequence("Ctrl+0"), self, self._reset_zoom)
+        QShortcut(QKeySequence("Ctrl+S"), self, self._save_current_file)
+
+    def _save_current_file(self):
+        if self.home_tabs.save_current():
+            self.status_label.setText("\u25CF saved")
+        else:
+            self.status_label.setText("\u25CF nothing to save")
 
     # ---------------- UI construction ---------------- #
 
@@ -1297,11 +2473,12 @@ class Dashboard(QMainWindow):
 
         root.addWidget(self._header_bar())
 
-        # Four header sections; Home is the default one.
+        # Header sections; Home is the default one. (The file browser lives
+        # inside Home -- files above, file contents below -- so there is no
+        # separate Files section to get lost in.)
         self.stack = QStackedWidget()
         self.stack.addWidget(self._home_page())    # 0 -- Home (default)
         self.stack.addWidget(self._tasks_page())   # 1 -- Tasks
-        self.stack.addWidget(self._files_page())   # 2 -- Files
         self.stack.currentChanged.connect(self._sync_nav)
         root.addWidget(self.stack, stretch=1)
 
@@ -1353,7 +2530,7 @@ class Dashboard(QMainWindow):
 
         self.nav_group = QButtonGroup(self)
         self.nav_buttons = {}
-        for idx, label in enumerate(("Home", "Tasks", "Files")):
+        for idx, label in enumerate(("Home", "Tasks")):
             btn = QPushButton(label)
             btn.setObjectName("navButton")
             btn.setCheckable(True)
@@ -1377,7 +2554,7 @@ class Dashboard(QMainWindow):
 
     def _sync_nav(self, idx: int):
         """Keep the nav pill in sync whenever the section changes."""
-        labels = ("Home", "Tasks", "Files")
+        labels = ("Home", "Tasks")
         if 0 <= idx < len(labels):
             self.nav_buttons[labels[idx]].setChecked(True)
 
@@ -1390,7 +2567,11 @@ class Dashboard(QMainWindow):
         return os.path.abspath(path)
 
     def _home_page(self):
-        """Default section: folder tree (left) + chat with the models (right)."""
+        """Three columns, VS Code-style: files left, code center, chat right.
+
+        The columns have bounded widths so a long tab or path in the middle
+        can never shove the chat aside.
+        """
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(18, 16, 18, 12)
@@ -1398,15 +2579,133 @@ class Dashboard(QMainWindow):
 
         split = QSplitter(Qt.Orientation.Horizontal)
         split.setObjectName("mainSplitter")
-        self.home_files = FilesPanel(self._workspace_path(), compact=True)
+        split.setChildrenCollapsible(True)
+        self.home_split = split
+        self.home_files = FilesPanel(self._workspace_path())
+        self.home_tabs = WorkspaceTabs(self._workspace_path())
         self.chat_panel = ChatPanel(self.config)
+        self.home_files.workspace_tabs = self.home_tabs
+        self.home_tabs.opened = self.home_files.update_open_list
+        self.chat_panel.workspace_tabs = self.home_tabs
+        self.chat_panel.project_root = self._workspace_path()
+        self.home_tabs.tabs_changed.connect(lambda _n: self._sync_code_pane())
+        self.home_tabs.file_saved.connect(
+            lambda p: self.chat_panel.append_system(f"\U0001F4BE Saved {os.path.basename(p)}")
+        )
+        self.home_files.code_toggle.toggled.connect(lambda _on: self._sync_code_pane())
         self.chat_panel.run_requested.connect(self._on_run_requested)
+        self.chat_panel.choose_folder_requested.connect(self._choose_projects_folder)
+        self.chat_panel.command_requested.connect(self._on_command_requested)
         split.addWidget(self.home_files)
+        split.addWidget(self.home_tabs)
         split.addWidget(self.chat_panel)
-        split.setStretchFactor(0, 1)
-        split.setStretchFactor(1, 2)
+        # LEFT and RIGHT keep their width; the MIDDLE code column is the one
+        # that grows/shrinks -- and it disappears entirely when no file is
+        # open, handing its space to the chat.
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setStretchFactor(2, 0)
+        sizes = self.ui_state.get("splitter") or [280, 520, 560]
+        split.setSizes(sizes)
         layout.addWidget(split, stretch=1)
+        self._sync_code_pane(restoring=True)
         return page
+
+    def _sync_code_pane(self, restoring: bool = False):
+        """Code column visible only when a file is open AND the toggle is on.
+        Closing the last tab hides it, handing the space back to the chat."""
+        has_tabs = self.home_tabs.tabs.count() > 0
+        toggle = self.home_files.code_toggle
+        if not has_tabs and not toggle.isChecked():
+            toggle.blockSignals(True)
+            toggle.setChecked(True)
+            toggle.blockSignals(False)
+        self.home_tabs.setVisible(has_tabs and toggle.isChecked())
+        if has_tabs and not restoring:
+            self.chat_panel.set_idle(self.chat_panel._hud_base)
+
+    def _toggle_code_pane_forced(self, _on: bool):
+        self._sync_code_pane()
+
+    def _set_zoom(self, delta: float):
+        self.ui_zoom = max(0.6, min(2.2, self.ui_zoom + delta))
+        self.chat_panel.apply_zoom(self.ui_zoom)
+        self.home_tabs.apply_zoom(self.ui_zoom)
+
+    def _reset_zoom(self):
+        self.ui_zoom = 1.0
+        self.chat_panel.apply_zoom(self.ui_zoom)
+        self.home_tabs.apply_zoom(self.ui_zoom)
+
+    # ---------------- terminal commands (client-agent access) ---------------- #
+
+    def _terminal_tool_manager(self):
+        from agentos.tools import ToolManager
+        tools = ToolManager(self._workspace_path(),
+                            extra_roots=getattr(self.chat_panel, "last_tagged", []),
+                            allow_outside=getattr(self.config, "allow_pc_access", False))
+        return tools
+
+    def _approve_command_in_run(self, command: str) -> bool:
+        """Called from the run thread when the pipeline wants to execute a
+        command: always allowed when confirm_commands is off, otherwise the
+        question is marshalled to the UI thread and answered there."""
+        if not getattr(self.config, "confirm_commands", True):
+            return True
+        self._approval_result = False
+        try:
+            QMetaObject.invokeMethod(
+                self, "_show_command_approval",
+                Qt.ConnectionType.BlockingQueuedConnection,
+                Q_ARG(str, command),
+            )
+        except Exception:
+            return False
+        return self._approval_result
+
+    @pyqtSlot(str)
+    def _show_command_approval(self, command: str):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Agent wants to run a command")
+        box.setText("The agent wants to run this command on your PC:")
+        box.setInformativeText(command)
+        box.setStandardButtons(QMessageBox.StandardButton.Yes
+                               | QMessageBox.StandardButton.No)
+        self._approval_result = box.exec() == QMessageBox.StandardButton.Yes
+
+    def _on_command_requested(self, command: str, tags: list):
+        """Run a terminal command the user typed (after confirming it)."""
+        if not command.strip():
+            return
+        if getattr(self.config, "confirm_commands", True):
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("Run terminal command?")
+            box.setText(f"Run this command in:\n{self._workspace_path()}")
+            box.setInformativeText(command)
+            box.setStandardButtons(QMessageBox.StandardButton.Yes
+                                   | QMessageBox.StandardButton.No)
+            if box.exec() != QMessageBox.StandardButton.Yes:
+                self.chat_panel.append_system("\u2318 Command cancelled")
+                self.chat_panel.set_idle("Ready")
+                return
+        tools = self._terminal_tool_manager()
+        for tag in tags or []:
+            tools.add_root(tag)
+        base = os.path.basename(command.strip().split()[0]).lower()
+        if base in ("cd",):
+            self.chat_panel.append_terminal(
+                command, "(cd only changes a directory; use the Projects folder "
+                "picker or tag the target file with @)", False)
+            self.chat_panel.set_idle("Ready")
+            return
+        ok, output, _code = tools.run_command(command, timeout=300)
+        self.chat_panel.append_terminal(command, output, ok)
+        self.chat_panel.set_idle("Command finished" if ok else "Command failed")
+        self.status_label.setText(
+            f"\u25CF command {'ok' if ok else 'failed'}: {command[:60]}"
+        )
 
     def _tasks_page(self):
         """Agents, task queue, execution log, memory and the model manager."""
@@ -1432,14 +2731,61 @@ class Dashboard(QMainWindow):
         layout.addWidget(splitter, stretch=1)
         return page
 
-    def _files_page(self):
-        """Full-width explorer for everything the models created."""
-        page = QWidget()
-        layout = QVBoxLayout(page)
-        layout.setContentsMargins(18, 16, 18, 12)
-        self.files_full = FilesPanel(self._workspace_path(), compact=False)
-        layout.addWidget(self.files_full, stretch=1)
-        return page
+    def _workspace_is_set(self) -> bool:
+        """True only if the user actually chose a projects folder (i.e. it is
+        saved in config.yaml). The built-in default does not count, so a
+        first-run user is always asked."""
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+        try:
+            with open(path) as f:
+                raw = yaml.safe_load(f) or {}
+        except (OSError, yaml.YAMLError):
+            return False
+        return bool(str(raw.get("workspace_dir") or "").strip())
+
+    def _first_run_check(self):
+        """First launch -> ask for the projects folder; chat stays disabled
+        until one is chosen (there is nowhere to work otherwise)."""
+        if self._workspace_is_set():
+            self.chat_panel.set_ready(True)
+            return
+        dialog = WelcomeDialog(self)
+        if dialog.exec() and dialog.chosen_path:
+            self._set_workspace(dialog.chosen_path)
+        else:
+            self.chat_panel.set_ready(False)
+
+    def _choose_projects_folder(self):
+        """Pick where projects are created/opened (chat's Folder button and
+        the welcome dialog both land here)."""
+        start = self.config.workspace_dir or os.path.expanduser("~")
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Choose the folder where projects live", start
+        )
+        if chosen:
+            self._set_workspace(chosen)
+
+    def _set_workspace(self, path: str):
+        """Point the app at a projects folder, persist it, enable chat."""
+        self.config.workspace_dir = path
+        try:
+            self.config.save()
+        except Exception as e:
+            QMessageBox.warning(
+                self, "Could not save settings",
+                f"The folder is active for this session only:\n{e}",
+            )
+        self.home_files.set_root(path)
+        self.home_tabs.set_project_root(path)
+        self.home_files.update_open_list([])
+        self.chat_panel.project_root = os.path.abspath(path)
+        self.chat_panel.refresh_tag_model()
+        self.chat_panel.set_ready(True)
+        self.chat_panel.append_system(f"\U0001F4C2 Projects folder: {path}")
+        self.chat_panel.append_system(
+            "Type @ in the chat to attach a file (from this folder or anywhere "
+            "on your PC) and tell the planner what to change in it."
+        )
 
     def _model_manager_box(self):
         box = QGroupBox("\U0001F9E9  Model Manager")
@@ -1481,6 +2827,10 @@ class Dashboard(QMainWindow):
             self._refresh_model_manager_box()
             self.chat_panel.config = self.config
             self.chat_panel.refresh_roles()
+            # A workspace change in Settings re-points the file panels and
+            # unlocks chat if a folder was finally chosen.
+            self.home_files.set_root(self._workspace_path())
+            self.chat_panel.set_ready(self._workspace_is_set())
 
     def _agent_dashboard_box(self):
         box = QGroupBox("\U0001F916  Agent Dashboard")
@@ -1543,6 +2893,14 @@ class Dashboard(QMainWindow):
     # ---------------- Run handling ---------------- #
 
     def _on_run_requested(self, goal: str):
+        if not self._workspace_is_set():
+            self.chat_panel.append_system(
+                "\U0001F4C2 Choose a projects folder first (Folder\u2026) \u2014 "
+                "projects are created inside it."
+            )
+            return
+        self.chat_panel.reset_run_hud()
+        self.chat_panel.set_activity("Planner is planning the goal")
         project_name = self.chat_panel.project_input.text().strip() or "generated_project"
         if not goal:
             goal = ("Build a PyQt6 calculator application with a numeric display "
@@ -1556,7 +2914,7 @@ class Dashboard(QMainWindow):
             "live progress shows up here and on the Tasks tab."
         )
 
-        self.chat_panel.run_button.setEnabled(False)
+        self.chat_panel.set_activity("Planner is planning the goal")
         self.status_label.setText("\u25CF Running...")
         self.status_label.setStyleSheet("color: #58a6ff;")
         self.log_view.clear()
@@ -1568,7 +2926,12 @@ class Dashboard(QMainWindow):
             lbl.setStyleSheet("color: #8b949e;")
 
         self.thread = QThread()
-        self.worker = BrainWorker(goal, project_name, self.config)
+        self.worker = BrainWorker(
+            goal, project_name, self.config,
+            extra_roots=getattr(self.chat_panel, "last_tagged", []),
+            command_approver=self._approve_command_in_run,
+            test_command=getattr(self.config, "test_command", ""),
+        )
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.log_line.connect(self._append_log)
@@ -1584,6 +2947,46 @@ class Dashboard(QMainWindow):
 
     def _handle_event(self, evt: dict):
         kind = evt.get("kind")
+
+        # ---- live HUD: what is running right now, and line deltas ----
+        hud_updates = {
+            "planning_started": "Planner is planning the goal",
+            "plan_ready": "Planner: plan ready \u2014 dispatching tasks",
+            "test_run_started": "Testing agent: running pytest",
+        }
+        if kind in hud_updates:
+            self.chat_panel.set_activity(hud_updates[kind])
+        elif kind == "action_started":
+            self.chat_panel.set_activity(
+                f"{evt.get('agent', 'agent')} \u00B7 writing {evt.get('path', '')}"
+            )
+        elif kind == "planner_review":
+            self.chat_panel.set_activity(
+                f"Planner is checking {os.path.basename(evt.get('path', ''))}"
+            )
+        elif kind == "file_diff":
+            added = int(evt.get("added", 0))
+            removed = int(evt.get("removed", 0))
+            self.chat_panel.add_diff(evt.get("path", ""), added, removed)
+            self.home_files.mark_changed(added, removed)
+        elif kind == "thinking":
+            self.chat_panel.append_thinking(
+                evt.get("stage", "Think"), evt.get("title", ""), evt.get("detail", "")
+            )
+        elif kind == "stage":
+            name = evt.get("name", "Stage")
+            status = evt.get("status", "")
+            mark = {"done": "\u2713", "failed": "\u2717", "running": "\u25CF"}.get(status, "\u2022")
+            self.chat_panel.append_thinking(
+                "Pipeline", f"{mark} {name} ({status})", evt.get("detail", "")
+            )
+            self.chat_panel.set_activity(f"Pipeline \u00B7 {name}")
+        elif kind == "command_run":
+            self.chat_panel.append_terminal(
+                evt.get("command", ""), evt.get("output", ""), bool(evt.get("ok"))
+            )
+        elif kind == "run_complete":
+            self.chat_panel.set_idle(f"Run complete: {evt.get('final_status', '')}")
 
         # Mirror the interesting pipeline events into the chat so the
         # conversation shows what the planner/workers are actually doing.
@@ -1668,7 +3071,7 @@ class Dashboard(QMainWindow):
         return item
 
     def _on_finished(self, report: dict):
-        self.chat_panel.run_button.setEnabled(True)
+        self.chat_panel.set_idle(f"Finished: {report.get('final_status', 'unknown')}")
         status = report.get("final_status", "unknown")
         color = STATUS_COLORS.get(status, "#8b949e")
         self.status_label.setStyleSheet(f"color: {color};")
@@ -1677,11 +3080,27 @@ class Dashboard(QMainWindow):
             f"project: {report.get('project_root')}"
         )
         root = report.get("project_root")
+        project_dir = os.path.dirname(root) if root else None
         if root and os.path.isdir(root):
-            # Point every folder section at the generated project so the
-            # files the models created can be opened and read right away.
+            # Point the files panel at the generated project and auto-open
+            # the first code file so the user sees "it open" right away.
             self.home_files.set_root(root)
-            self.files_full.set_root(root)
+            self.home_tabs.set_project_root(root)
+            # auto-open the project's code files (tabs open by themselves)
+            opened = []
+            for dirpath, _dirnames, filenames in os.walk(root):
+                for name in sorted(filenames):
+                    if name.endswith((".py", ".md", ".txt", ".json", ".yaml", ".yml",
+                                       ".toml", ".cfg", ".ini")):
+                        self.home_tabs.auto_open(
+                            os.path.relpath(os.path.join(dirpath, name), root),
+                            root_path=root)
+                        opened.append(name)
+                        if len(opened) >= 6:
+                            break
+                if len(opened) >= 6:
+                    break
+            self.home_files.update_open_list(self.home_tabs.open_paths())
             self.fs_model.setRootPath(root)
             self.file_tree.setRootIndex(self.fs_model.index(root))
 
@@ -1704,11 +3123,18 @@ class Dashboard(QMainWindow):
             self._append_log(f"[Memory Viewer] could not load history: {e}")
 
     def _on_failed(self, error: str):
-        self.chat_panel.run_button.setEnabled(True)
+        self.chat_panel.set_idle("Run failed")
         self.chat_panel.append_system(f"\u26A0 Run failed: {error}")
         self.status_label.setStyleSheet("color: #f85149;")
         self.status_label.setText(f"\u25CF FAILED: {error}")
-        QMessageBox.critical(self, "Run failed", error)
+        # Errors must be copyable: a message box whose details are
+        # selectable + copyable (and the same text is in the chat above).
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Critical)
+        box.setWindowTitle("Run failed")
+        box.setText("The run failed. Full error (selectable, copyable) below:")
+        box.setDetailedText(error or "(no error text)")
+        box.exec()
 
 
 def main():

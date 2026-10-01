@@ -31,8 +31,21 @@ class Planner:
     def __init__(self, llm_provider):
         self.llm = llm_provider
 
-    def plan(self, goal: str) -> dict:
-        prompt = f"Goal: {goal}\n\nDecompose this into the plan tree JSON described in the system prompt."
+    def plan(self, goal: str, context: str = "") -> dict:
+        """Decompose a goal into the plan tree.
+
+        `context` is a short inventory of what already exists in the target
+        folder (project context step) so the plan extends/repairs instead of
+        blindly regenerating -- the difference between "random code" and a
+        real change request.
+        """
+        prompt = f"Goal: {goal}\n"
+        if context:
+            prompt += (
+                "\nExisting project context (extend/repair this, do not "
+                f"recreate it blindly):\n{context}\n"
+            )
+        prompt += "\nDecompose this into the plan tree JSON described in the system prompt."
         plan = self.llm.generate_json(SYSTEM_PROMPT, prompt, max_tokens=3000)
         self._validate(plan)
         return plan

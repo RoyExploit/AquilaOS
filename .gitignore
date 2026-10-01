@@ -5,6 +5,8 @@
 # config.yaml.example is the safe template that IS committed.
 config.yaml
 config.yaml.bak
+# Remembered window/splitter/zoom state (per machine -- not shared).
+ui_state.json
 .env
 .env.*
 *.env

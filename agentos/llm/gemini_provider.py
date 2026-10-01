@@ -1,12 +1,15 @@
 import os
 import re
-import time
 import requests
 from .base import LLMProvider, LLMResponse, sanitize_api_key
 
 
 class GeminiProvider(LLMProvider):
     name = "gemini"
+    # Google's *hot-swapped* alias -- it always points at the current Flash
+    # model, so this constant never needs editing when Google ships 3.9/4.0.
+    # (Only used if the live catalog can't be reached at all; normally the
+    # model is resolved from the key's catalog via preferred_chat_model.)
     default_model = "gemini-flash-latest"
 
     # Catalog entries that exist but can't answer a normal chat prompt
@@ -25,10 +28,15 @@ class GeminiProvider(LLMProvider):
     def preferred_chat_model(cls, ids, preferred: str | None = None) -> str:
         """Auto-pick a chat-capable Gemini model from the key's live catalog.
 
-        The Gemini catalog mixes chat, TTS, image, robotics... models and
-        silently rotates/deprecates versions, so this ranks the chat-capable
-        'gemini-*' entries: non-lite first, stable over preview, flash tier
-        (broadly available on API-key plans), then newest version number.
+        Google documents two naming styles: a *stable* string that names one
+        exact model (``gemini-3.6-flash``) and a *latest* alias that Google
+        hot-swaps on every release (``gemini-flash-latest``). We rank the
+        alias first: that hands model versioning to Google, so "auto" keeps
+        working when 3.8 becomes 3.9 without anyone editing our code.
+
+        Everything else is a tiebreak, and the whole list is only ever used
+        as a fallback ladder -- if the chosen model is overloaded or retired
+        at call time, `LLMProvider.generate()` walks to the next entry.
         """
         ids = list(ids)
         candidates = [m for m in ids
@@ -41,10 +49,11 @@ class GeminiProvider(LLMProvider):
         def rank(m: str):
             version = tuple(int(n) for n in re.findall(r"\d+", m))
             return (
-                0 if "lite" in m else 1,      # full tier over lite
-                0 if "preview" in m else 1,   # stable over preview
-                1 if "flash" in m else 0,     # flash tier answers on more plans
-                version,                      # newest first
+                1 if m.endswith("-latest") else 0,  # Google's pointer over a frozen version
+                0 if "lite" in m else 1,            # full tier over lite
+                1 if "flash" in m else 0,           # flash works on more plans than pro
+                0 if "preview" in m else 1,         # stable over preview
+                version,                            # newest as the last tiebreak
             )
 
         return max(candidates, key=rank)
@@ -68,34 +77,29 @@ class GeminiProvider(LLMProvider):
         return sorted({n for n in names if n}, reverse=True)
 
     def _generate(self, system, prompt, max_tokens=2000, temperature=0.2) -> LLMResponse:
+        # Retry/backoff for 503 "high demand" and model fallback are handled
+        # centrally by LLMProvider.generate(), so this is a single clean call.
         url = (
             f"https://generativelanguage.googleapis.com/v1beta/models/"
             f"{self.model}:generateContent?key={self.api_key}"
         )
-        resp = None
-        for attempt in range(3):
-            resp = requests.post(
-                url,
-                json={
-                    "system_instruction": {"parts": [{"text": system}]},
-                    "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-                    "generationConfig": {
-                        # Gemini 2.5+/3.x thinking models spend the output-token
-                        # budget on reasoning first, so a small max_tokens can
-                        # leave zero tokens for the answer (finishReason
-                        # MAX_TOKENS + empty content). Keep a generous floor --
-                        # models stop on their own when done anyway.
-                        "maxOutputTokens": max(max_tokens, 8192),
-                        "temperature": temperature,
-                    },
+        resp = requests.post(
+            url,
+            json={
+                "system_instruction": {"parts": [{"text": system}]},
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    # Gemini 2.5+/3.x thinking models spend the output-token
+                    # budget on reasoning first, so a small max_tokens can
+                    # leave zero tokens for the answer (finishReason
+                    # MAX_TOKENS + empty content). Keep a generous floor --
+                    # models stop on their own when done anyway.
+                    "maxOutputTokens": max(max_tokens, 8192),
+                    "temperature": temperature,
                 },
-                timeout=120,
-            )
-            # 503 = transient "high demand" -- brief backoff, then give up.
-            if resp.status_code == 503 and attempt < 2:
-                time.sleep(1.5 * (attempt + 1))
-                continue
-            break
+            },
+            timeout=120,
+        )
         resp.raise_for_status()
         data = resp.json()
         candidates = data.get("candidates") or []

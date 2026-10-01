@@ -8,6 +8,9 @@ class LMStudioProvider(LLMProvider):
     """
 
     name = "lmstudio"
+    # You deliberately loaded this model -- never silently swap it out on a
+    # transient error (retries only).
+    switch_model_on_overload = False
 
     def __init__(self, model: str = "local-model", base_url: str = "http://localhost:1234/v1", **kwargs):
         super().__init__(model, **kwargs)

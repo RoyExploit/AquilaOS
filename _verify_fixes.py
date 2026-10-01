@@ -1,11 +1,20 @@
 """Verify: (a) settings selections never silently reset, (b) planner
 orchestration: casual chat -> [[DISPATCH]] -> pipeline, planner review loop."""
-import sys, os, shutil, time
+import sys, os, shutil, tempfile, time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-# --- protect the real config.yaml from being rewritten by save() tests ---
-shutil.copy("config.yaml", "config.yaml.bak")
+# --- keep the user's real config.yaml completely out of this test ----------
+# Every save()/load() from here on is redirected to a scratch file. An
+# interrupted run can therefore never leave a fake key in the real config
+# (a leftover "api_key: AQ.x" from a half-finished run is exactly what
+# produced the earlier stray 401s).
+import agentos.config as _config_mod
+
+REAL_CONFIG = _CfgReal = _config_mod.AgentOSConfig.load()   # read the real one first
+SCRATCH_DIR = tempfile.mkdtemp(prefix="agentos_cfg_")
+_config_mod.DEFAULT_CONFIG_PATH = os.path.join(SCRATCH_DIR, "config.yaml")
+REAL_CONFIG.save(_config_mod.DEFAULT_CONFIG_PATH)           # seed realistic values
 
 try:
     from PyQt6.QtWidgets import QApplication, QMessageBox
@@ -113,7 +122,7 @@ try:
     try:
         import requests
         requests.get("http://localhost:11434/api/tags", timeout=3).raise_for_status()
-        real_cfg = AgentOSConfig.load()
+        real_cfg = REAL_CONFIG
         w = D.ChatWorker("planner", dict(real_cfg.planner),
                          "I want a small calculator app with buttons. Can you handle it?")
         got = {}
@@ -131,7 +140,8 @@ try:
 
     print("ALL_VERIFY_OK")
 finally:
-    shutil.move("config.yaml.bak", "config.yaml")
-    # tidy test projects
+    # tidy test projects + the scratch config (the real config.yaml was never
+    # touched -- see the redirect at the top of this file)
     for p in ("workspace/_verify_project", "workspace/_verify_project2"):
         shutil.rmtree(p, ignore_errors=True)
+    shutil.rmtree(SCRATCH_DIR, ignore_errors=True)
