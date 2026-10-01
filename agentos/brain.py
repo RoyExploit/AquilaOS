@@ -183,6 +183,8 @@ class CoreBrain:
                     emit("thinking", stage="Verify",
                          title=f"Verification failed on {action['target_path']}",
                          detail=err.strip()[:800])
+                    emit("stage", name="Repair", status="running",
+                         detail=f"{action['target_path']}: {err.strip()[:200]}")
                     self.memory.log(project_id, "verify_fail", action["id"], err)
                     fixed, attempts = repair.repair_file(
                         action["target_path"], err, verification.verify_file
@@ -199,6 +201,13 @@ class CoreBrain:
                                 f"-- fixed={fixed} after {attempts} attempt(s)"),
                          detail=f"error fed to the worker:\n{err.strip()[:600]}")
                     emit("repair_done", action_id=action["id"], fixed=fixed, attempts=attempts)
+                    emit("stage", name="Repair",
+                         status="done" if fixed else "failed",
+                         detail=(f"{action['target_path']} -- fixed after "
+                                 f"{attempts} attempt(s)" if fixed else
+                                 f"{action['target_path']} -- UNREPAIRED after "
+                                 f"{attempts} attempt(s); the run is marked "
+                                 f"escalation_required"))
                     if not fixed:
                         action_report["status"] = "failed_unrepaired"
                         report["final_status"] = "escalation_required"
@@ -224,6 +233,10 @@ class CoreBrain:
                                     f"{feedback[:700]}")
                         self.memory.log(project_id, "planner_review",
                                         action["id"], f"{status}: {feedback[:400]}")
+                        if not approved:
+                            emit("stage", name="Review", status="running",
+                                 detail=(f"{action['target_path']} rejected by the "
+                                         f"planner: {feedback[:200]}"))
                         if not approved and self.max_repair_attempts > 0:
                             fixed, attempts = repair.repair_file(
                                 action["target_path"], feedback,
@@ -250,6 +263,13 @@ class CoreBrain:
                             emit("planner_review_fixed", action_id=action["id"],
                                  path=action["target_path"], fixed=fixed,
                                  attempts=attempts, status=status)
+                            emit("stage", name="Review",
+                                 status="done" if fixed else "failed",
+                                 detail=f"{action['target_path']}: {status}")
+                        elif not approved:
+                            emit("stage", name="Review", status="failed",
+                                 detail=(f"{action['target_path']} rejected and no "
+                                         f"repair attempts are configured"))
                         action_report["planner_review"] = status
 
                 # Security Agent pass: every generated python file gets scanned.
@@ -276,26 +296,47 @@ class CoreBrain:
              detail=(log or "")[-800:])
 
         if not passed:
-            print("[CoreBrain] Tests failed -- attempting repair on test file(s)...")
+            print("[CoreBrain] Tests failed -- attempting repair...")
+            emit("stage", name="Repair", status="running",
+                 detail="pytest failed -- routing the exact error back to the worker")
             emit("thinking", stage="Tests",
                  title="pytest failed -- routing the failure back to the worker",
                  detail=(log or "")[-1200:])
+            # The test states the intent, so the CODE must conform to it:
+            # repair the implementation first. Only if the source cannot be
+            # made to pass do we touch the test itself -- a test that was bent
+            # until it agreed with broken code is worse than a failing test,
+            # because it hides the bug behind a green run.
+            impl_actions = [a for a in actions
+                            if a["type"] == "generate_file"
+                            and a["target_path"].endswith(".py")]
             test_actions = [a for a in actions if a["type"] == "generate_test"]
-            for a in test_actions:
-                fixed, attempts = repair.repair_file(
-                    a["target_path"], log, lambda p: testing.run_suite(".")
-                )
-                self._emit_write_diff(emit, tools, a["id"])
-                self.memory.log(project_id, "repair_test", a["id"], f"fixed={fixed}")
-                emit("thinking", stage="Repair",
-                     title=(f"Test file re-prompted: {a['target_path']} "
-                            f"-- fixed={fixed} after {attempts} attempt(s)"),
-                     detail="pytest output was fed back to the worker.")
-                emit("repair_done", action_id=a["id"], fixed=fixed, attempts=attempts)
-                if fixed:
-                    passed, log = testing.run_suite(".")
+            for label, group in (("implementation", impl_actions),
+                                 ("test", test_actions)):
+                for a in group:
+                    if passed:
+                        break
+                    fixed, attempts = repair.repair_file(
+                        a["target_path"], log, lambda p: testing.run_suite(".")
+                    )
+                    self._emit_write_diff(emit, tools, a["id"])
+                    self.memory.log(project_id, "repair_test", a["id"],
+                                    f"target={label} fixed={fixed}")
+                    emit("thinking", stage="Repair",
+                         title=(f"{label} file re-prompted: {a['target_path']} "
+                                f"-- fixed={fixed} after {attempts} attempt(s)"),
+                         detail="pytest output was fed back to the worker.")
+                    emit("repair_done", action_id=a["id"], fixed=fixed,
+                         attempts=attempts, target=label)
+                    if fixed:
+                        passed, log = testing.run_suite(".")
             report["tests_passed"] = passed
             report["test_log"] = log
+            emit("stage", name="Repair",
+                 status="done" if passed else "failed",
+                 detail=("tests pass after repair" if passed else
+                         f"still failing after {self.max_repair_attempts} attempt(s) "
+                         f"per file:\n" + (log or "")[-500:]))
 
         final_status = "completed" if (report["final_status"] != "escalation_required" and passed) else "escalation_required"
 
@@ -328,6 +369,16 @@ class CoreBrain:
         report["project_root"] = str(project_root.resolve())
         report["project_id"] = project_id
         emit("run_complete", final_status=final_status, project_root=report["project_root"])
-        emit("stage", name="Apply", status="done",
-             detail=f"Files written under {report['project_root']}")
+        # "Apply" reports the REAL outcome. Files are written as they are
+        # generated, so a run that needed repairs -- or never got the tests
+        # green -- must not look like a clean apply.
+        if final_status == "completed":
+            emit("stage", name="Apply", status="done",
+                 detail=f"Every stage passed. Files are under {report['project_root']}")
+        else:
+            emit("stage", name="Apply", status="failed",
+                 detail=(f"Finished as '{final_status}' -- the files ARE on disk "
+                         f"under {report['project_root']}, but this run did not "
+                         f"pass cleanly. Read the Repair / Test cards above "
+                         f"before trusting the output."))
         return report

@@ -13,6 +13,7 @@ class VerificationEngine:
         self.tools = tool_manager
 
     def verify_file(self, relative_path: str) -> tuple[bool, str]:
-        if not relative_path.endswith(".py"):
-            return True, "skipped (non-python file)"
+        """Cheap, reliable checks for every generated file type: Python syntax
+        for .py, well-formed JSON/YAML for manifests. Types with no cheap
+        check return ok -- verify_file never claims more than it checked."""
         return self.tools.check_syntax(relative_path)

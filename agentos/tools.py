@@ -6,6 +6,7 @@ target_path like '../../etc/passwd' is rejected rather than executed.
 """
 import subprocess
 import py_compile
+import json
 import os
 import sys
 import difflib
@@ -89,12 +90,32 @@ class ToolManager:
         return self._safe_path(relative_path).read_text()
 
     def check_syntax(self, relative_path: str) -> tuple[bool, str]:
+        """Cheapest reliable check for this file type. .py gets compiled,
+        .json/.yaml manifests get parsed -- a malformed manifest used to be
+        waved through as "skipped (non-python file)", which meant a broken
+        requirements/config file could only surface much later, if at all."""
         p = self._safe_path(relative_path)
-        try:
-            py_compile.compile(str(p), doraise=True)
-            return True, ""
-        except py_compile.PyCompileError as e:
-            return False, str(e)
+        suffix = p.suffix.lower()
+        if suffix == ".py":
+            try:
+                py_compile.compile(str(p), doraise=True)
+                return True, ""
+            except py_compile.PyCompileError as e:
+                return False, str(e)
+        if suffix == ".json":
+            try:
+                json.loads(p.read_text(encoding="utf-8"))
+                return True, ""
+            except (OSError, ValueError) as e:
+                return False, f"invalid JSON: {e}"
+        if suffix in (".yaml", ".yml"):
+            try:
+                import yaml
+                yaml.safe_load(p.read_text(encoding="utf-8"))
+                return True, ""
+            except (OSError, ValueError) as e:
+                return False, f"invalid YAML: {e}"
+        return True, ""
 
     def run_command(self, command: str, cwd: str | None = None,
                     timeout: int = 180) -> tuple[bool, str, int]:
