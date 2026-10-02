@@ -24,6 +24,13 @@ d.nav_buttons["Tasks"].click(); app.processEvents()
 d.nav_buttons["Home"].click(); app.processEvents()
 print("tasks/home switch ok ->", d.stack.currentIndex() == 0)
 
+# ---------- column order is part of the contract: files | code | chat ----------
+order = [d.home_split.widget(i) for i in range(d.home_split.count())]
+print("column order (files, code, chat) ->",
+      order == [d.home_files, d.home_tabs, d.chat_panel])
+print("files column has no show/hide toggle ->",
+      not hasattr(d.chat_panel, "files_button"))
+
 # ---------- code column: opens on click, hides when all tabs close ----------
 root = d._workspace_path()
 proj = os.path.join(root, "_smoke")

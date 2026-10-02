@@ -81,6 +81,7 @@ from PyQt6.QtWidgets import (
     QMessageBox, QDialog, QDialogButtonBox, QComboBox, QSpinBox, QCheckBox,
     QScrollArea, QFrame, QSizePolicy, QStackedWidget, QTextBrowser,
     QButtonGroup, QMenu, QFileDialog, QTabBar, QCompleter, QInputDialog,
+    QListWidget, QListWidgetItem,
 )
 
 from agentos.config import AgentOSConfig
@@ -127,432 +128,11 @@ STATUS_COLORS = {
     "done": "#3fb950", "written": "#3fb950", "completed": "#3fb950",
     "clean": "#3fb950", "flagged_and_fixed": "#d29922",
     "flagged_unresolved": "#f85149", "failed_unrepaired": "#f85149",
-    "escalation_required": "#f85149", "started": "#58a6ff",
+    "escalation_required": "#f85149", "started": "#D97757",
 }
 
-# --------------------------------------------------------------------- #
-# Visual theme -- a modern dark palette (deep charcoal + violet accent)
-# applied across the main window and the Settings dialog.
-# --------------------------------------------------------------------- #
-
-_FONT_STACK = '"Segoe UI", "Inter", "Helvetica Neue", Arial, sans-serif'
-
-MODERN_STYLESHEET = f"""
-    * {{
-        font-family: {_FONT_STACK};
-    }}
-    QMainWindow, QWidget, QDialog {{
-        background-color: #0b0e14;
-        color: #e6e8ef;
-        font-size: 13px;
-    }}
-    /* QWidget's background rule also matches QLabels (subclasses), which
-       would paint an opaque box behind every label's text -- e.g. a dark
-       rectangle behind the header title. Keep labels see-through. */
-    QLabel {{ background-color: transparent; }}
-
-    /* ---- Header bar ---- */
-    QWidget#headerBar {{
-        background-color: #12141c;
-        border-bottom: 1px solid #23263080;
-    }}
-    QFrame#logoMark {{
-        background-color: #1b1e33;
-        border: 1px solid #3a3480;
-        border-radius: 10px;
-    }}
-    QLabel#logoLetter {{
-        color: #a89bff;
-        font-size: 18px;
-        font-weight: 800;
-        background-color: transparent;
-    }}
-    QLabel#headerTitle {{
-        color: #f2f3f8;
-        font-size: 17px;
-        font-weight: 700;
-        letter-spacing: 0.3px;
-    }}
-    QLabel#headerSubtitle {{
-        color: #7d8296;
-        font-size: 11px;
-    }}
-
-    /* ---- Header nav pills ---- */
-    QPushButton#navButton {{
-        background-color: transparent;
-        border: 1px solid transparent;
-        color: #8b93a7;
-        padding: 7px 18px;
-        border-radius: 999px;
-        font-weight: 600;
-        font-size: 12.5px;
-    }}
-    QPushButton#navButton:hover {{ background-color: #171a24; color: #d7dae4; }}
-    QPushButton#navButton:checked {{
-        background-color: #1b1e33;
-        border: 1px solid #3a3480;
-        color: #a89bff;
-    }}
-
-    /* ---- Chat section ---- */
-    QLabel#panelTitle {{ color: #f2f3f8; font-size: 15px; font-weight: 700; }}
-    QScrollArea#chatScroll {{
-        border: none;
-        background-color: transparent;
-    }}
-    QWidget#chatLog {{ background-color: transparent; }}
-    QFrame#bubbleUser {{
-        background-color: #251d55;
-        border: 1px solid #7c5cff;
-        border-radius: 14px;
-    }}
-    QFrame#bubbleBot {{
-        background-color: #171a24;
-        border: 1px solid #2a2f3f;
-        border-radius: 14px;
-    }}
-    QLabel#bubbleNameMine {{ color: #b9a8ff; font-size: 10.5px; font-weight: 700; }}
-    QLabel#bubbleName {{ color: #8fb8ff; font-size: 10.5px; font-weight: 700; }}
-    QLabel#chatSystem {{ color: #7d8296; font-size: 11.5px; }}
-    QComboBox#roleCombo {{
-        background-color: #171a24;
-        border: 1px solid #2a2f3f;
-        border-radius: 999px;
-        padding: 5px 14px;
-        font-weight: 600;
-        min-width: 130px;
-    }}
-    QComboBox#roleCombo:focus {{ border: 1px solid #7c5cff; }}
-
-    /* ---- Code viewer ---- */
-    QPlainTextEdit#codeView {{
-        background-color: #0a0c12;
-        border: 1px solid #232735;
-        border-radius: 12px;
-        font-family: "Cascadia Code", "Consolas", "Menlo", monospace;
-        font-size: 12.5px;
-        color: #c9d4f2;
-        selection-background-color: #7c5cff;
-    }}
-    QLabel#pathChip {{
-        background-color: #171a24;
-        border: 1px solid #2a2f3f;
-        border-radius: 999px;
-        padding: 4px 12px;
-        color: #8fb8ff;
-        font-size: 11px;
-        font-family: "Cascadia Code", "Consolas", monospace;
-    }}
-
-    /* ---- Workspace panels (files above, file contents below) ---- */
-    QFrame#panelCard {{
-        background-color: #0f121a;
-        border: 1px solid #232735;
-        border-radius: 14px;
-    }}
-
-    /* thin rule inside a card (files tree / open files) */
-    QFrame#cardSeparator {{
-        border: none;
-        border-top: 1px solid #232735;
-        background: transparent;
-        max-height: 1px;
-        min-height: 1px;
-    }}
-
-    /* ---- Live HUD: what is happening right now + line deltas ---- */
-    QFrame#chatHud {{
-        background-color: rgba(23, 26, 36, 160);
-        border: 1px solid #232735;
-        border-radius: 12px;
-    }}
-    QLabel#hudDot {{ color: #7c5cff; font-size: 12px; }}
-    QLabel#hudText {{ color: #c9d4f2; font-size: 12px; }}
-    QLabel#hudDiff {{ font-size: 12px; font-weight: 700; }}
-    QLabel#diffLine {{ font-size: 11.5px; }}
-
-    /* ---- Code center: VS Code-like editor tabs ---- */
-    QTabWidget#codeTabs::pane {{
-        border: 1px solid #232735;
-        border-radius: 10px;
-        background-color: #0a0c12;
-        top: -1px;
-    }}
-    QTabBar#codeTabBar::tab {{
-        background-color: #0f121a;
-        color: #8b93a7;
-        border: 1px solid #232735;
-        border-bottom: none;
-        border-top-left-radius: 8px;
-        border-top-right-radius: 8px;
-        padding: 6px 10px 6px 14px;
-        margin-right: 3px;
-    }}
-    QTabBar#codeTabBar::tab:selected {{
-        background-color: #171a24;
-        color: #f2f3f8;
-    }}
-    QTabBar#codeTabBar::tab:hover:!selected {{
-        color: #d7dae4;
-    }}
-    QPushButton#tabClose {{
-        background-color: transparent;
-        border: none;
-        color: #5b6172;
-        font-size: 13px;
-        font-weight: 700;
-        padding: 0px;
-    }}
-    QPushButton#tabClose:hover {{
-        color: #f85149;
-    }}
-
-    /* ---- Planner/worker "Think" stream (compact, expandable) ---- */
-    QPushButton#thinkToggle {{
-        background-color: transparent;
-        border: 1px solid #2a2f3f;
-        border-radius: 999px;
-        color: #8b93a7;
-        padding: 5px 12px;
-        font-size: 11.5px;
-        font-weight: 600;
-    }}
-    QPushButton#thinkToggle:checked {{
-        background-color: #1b1e33;
-        border: 1px solid #3a3480;
-        color: #a89bff;
-    }}
-    QPushButton#thinkLine {{
-        background-color: transparent;
-        border: none;
-        color: #8fb8ff;
-        font-size: 11.5px;
-        text-align: left;
-        padding: 2px 0px;
-    }}
-    QPushButton#thinkLine:hover {{ color: #b9d0ff; }}
-    QLabel#thinkBody {{
-        color: #9aa3b8;
-        font-size: 11.5px;
-        font-family: "Cascadia Code", "Consolas", monospace;
-        padding-left: 14px;
-    }}
-    QLabel#terminalLine {{
-        color: #c9d4f2;
-        background-color: #0a0c12;
-        border-left: 2px solid #7c5cff;
-        padding: 6px 8px;
-        font-family: "Cascadia Code", "Consolas", monospace;
-        font-size: 11.5px;
-    }}
-
-    /* ---- Cards / group boxes ---- */
-    QGroupBox {{
-        background-color: #12151d;
-        border: 1px solid #232735;
-        border-radius: 12px;
-        margin-top: 14px;
-        padding: 14px 12px 12px 12px;
-        font-weight: 600;
-        font-size: 12.5px;
-        color: #c6cad6;
-    }}
-    QGroupBox::title {{
-        subcontrol-origin: margin;
-        subcontrol-position: top left;
-        left: 12px;
-        top: 2px;
-        padding: 0 4px;
-        color: #b7bdd0;
-    }}
-    QWidget#providerCard {{
-        background-color: transparent;
-    }}
-
-    /* ---- Inputs ---- */
-    QLineEdit, QPlainTextEdit, QComboBox, QSpinBox {{
-        background-color: #171a24;
-        border: 1px solid #2a2f3f;
-        border-radius: 8px;
-        padding: 6px 10px;
-        color: #e6e8ef;
-        selection-background-color: #7c5cff;
-    }}
-    QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QPlainTextEdit:focus {{
-        border: 1px solid #7c5cff;
-    }}
-    QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled {{
-        color: #565b6b;
-        background-color: #14161e;
-        border-color: #202331;
-    }}
-    QComboBox::drop-down {{
-        border: none;
-        width: 22px;
-    }}
-    QComboBox QAbstractItemView {{
-        background-color: #171a24;
-        border: 1px solid #2a2f3f;
-        selection-background-color: #7c5cff;
-        color: #e6e8ef;
-        outline: none;
-    }}
-    QCheckBox {{ color: #b7bdd0; spacing: 6px; }}
-
-    /* ---- Buttons ---- */
-    QPushButton {{
-        background-color: #1c1f2b;
-        color: #d7dae4;
-        border: 1px solid #2a2f3f;
-        border-radius: 8px;
-        padding: 7px 16px;
-        font-weight: 600;
-    }}
-    QPushButton:hover {{ background-color: #232739; border-color: #3a4056; }}
-    QPushButton:pressed {{ background-color: #191c27; }}
-    QPushButton:disabled {{ background-color: #14161e; color: #4d5164; border-color: #1c1f2b; }}
-
-    QPushButton#primaryButton {{
-        background-color: #7c5cff;
-        color: #ffffff;
-        border: 1px solid #7c5cff;
-    }}
-    QPushButton#primaryButton:hover {{ background-color: #8f72ff; }}
-    QPushButton#primaryButton:pressed {{ background-color: #6a4bfa; }}
-    QPushButton#primaryButton:disabled {{ background-color: #33304f; color: #7a7a92; border-color: #33304f; }}
-
-    QPushButton#secondaryButton {{
-        background-color: transparent;
-        color: #b7bdd0;
-        border: 1px solid #2a2f3f;
-    }}
-    QPushButton#secondaryButton:hover {{ background-color: #171a24; border-color: #7c5cff; color: #ffffff; }}
-
-    QPushButton#detectButton {{
-        background-color: #1a2333;
-        color: #8fb8ff;
-        border: 1px solid #2c3c58;
-        padding: 6px 12px;
-    }}
-    QPushButton#detectButton:hover {{ background-color: #20304a; }}
-
-    /* ---- Labels ---- */
-    QLabel#hintLabel {{ color: #7d8296; font-size: 11px; }}
-    QLabel#modelChip {{
-        background-color: #171a24;
-        border: 1px solid #2a2f3f;
-        border-radius: 999px;
-        padding: 4px 12px;
-        color: #b7bdd0;
-        font-size: 11.5px;
-        font-weight: 600;
-    }}
-    /* Underlined plain-text links: model chooser (under the chat box) and
-       the current task name (under the header). No boxes, no pills. */
-    QLabel#modelLink {{
-        color: #9aa3c0;
-        font-size: 11.5px;
-        text-decoration: underline;
-        padding: 0px;
-        background: transparent;
-        border: none;
-    }}
-    QLabel#modelLink:hover {{ color: #b9a8ff; }}
-    QLabel#sessionTitle {{
-        color: #7d8296;
-        font-size: 12px;
-        font-weight: 600;
-        text-decoration: underline;
-        padding: 0px;
-        background: transparent;
-        border: none;
-    }}
-    QLabel#sessionTitle:hover {{ color: #9aa3c0; }}
-    QLabel#agentPill {{
-        background-color: #12151d;
-        border: 1px solid #202331;
-        border-radius: 8px;
-        padding: 6px 10px;
-    }}
-    QLabel#statusBar {{
-        background-color: #12141c;
-        border-top: 1px solid #23263080;
-        padding: 7px 18px;
-        font-size: 11.5px;
-        font-weight: 600;
-    }}
-
-    /* ---- Settings dialog chrome ---- */
-    QWidget#dialogHeader {{
-        background-color: #12141c;
-        border-bottom: 1px solid #23263080;
-    }}
-    QLabel#dialogTitle {{ font-size: 16px; font-weight: 700; color: #f2f3f8; }}
-    QLabel#dialogSubtitle {{ font-size: 11.5px; color: #7d8296; }}
-    QWidget#dialogFooter {{
-        background-color: #0e1017;
-        border-top: 1px solid #23263080;
-    }}
-    QScrollArea#settingsScroll {{ border: none; background: transparent; }}
-    QGroupBox#sectionCard {{ background-color: #12151d; }}
-
-    /* ---- Tabs ---- */
-    QTabWidget::pane {{ border: 1px solid #232735; border-radius: 10px; top: -1px; }}
-    QTabBar::tab {{
-        background: transparent;
-        color: #7d8296;
-        padding: 8px 16px;
-        margin-right: 2px;
-        border-top-left-radius: 8px;
-        border-top-right-radius: 8px;
-        font-weight: 600;
-    }}
-    QTabBar::tab:selected {{ background: #12151d; color: #e6e8ef; border: 1px solid #232735; border-bottom: none; }}
-    QTabBar::tab:hover:!selected {{ color: #b7bdd0; }}
-
-    /* ---- Tables / trees ---- */
-    QTableWidget, QTreeView {{
-        background-color: #0f121a;
-        alternate-background-color: #12151d;
-        border: 1px solid #232735;
-        border-radius: 10px;
-        gridline-color: #1d2130;
-        color: #e6e8ef;
-    }}
-    QHeaderView::section {{
-        background-color: #171a24;
-        color: #9aa0b4;
-        border: none;
-        border-bottom: 1px solid #232735;
-        padding: 6px;
-        font-weight: 700;
-    }}
-    QTableWidget::item:selected, QTreeView::item:selected {{
-        background-color: #2a2440;
-        color: #ffffff;
-    }}
-    QPlainTextEdit#logView {{
-        background-color: #0a0c12;
-        border: 1px solid #232735;
-        border-radius: 10px;
-        font-family: "Cascadia Code", "Consolas", "Menlo", monospace;
-        font-size: 12px;
-        color: #b7d9ff;
-    }}
-
-    QSplitter#mainSplitter::handle {{ background-color: #0b0e14; width: 6px; }}
-
-    QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-    QScrollBar::handle:vertical {{ background: #2a2f3f; border-radius: 5px; min-height: 24px; }}
-    QScrollBar::handle:vertical:hover {{ background: #3a4056; }}
-    QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
-    QScrollBar:horizontal {{ background: transparent; height: 10px; margin: 2px; }}
-    QScrollBar::handle:horizontal {{ background: #2a2f3f; border-radius: 5px; min-width: 24px; }}
-
-    QMessageBox {{ background-color: #12151d; }}
-"""
-
+# Visual theme lives in agentos_theme.py (Claude Code desktop look).
+from agentos_theme import MODERN_STYLESHEET, ACCENT
 
 # --------------------------------------------------------------------- #
 # Background worker: runs the real CoreBrain off the UI thread
@@ -845,6 +425,8 @@ class ChatPanel(QWidget):
     run_requested = pyqtSignal(str)          # goal text -> full pipeline
     choose_folder_requested = pyqtSignal()   # "Folder..." clicked
     command_requested = pyqtSignal(str, list)  # command, approved roots
+    sessions_changed = pyqtSignal()          # sidebar "Recents" must refresh
+    files_toggled = pyqtSignal(bool)         # show/hide the files side panel
 
     def __init__(self, config: AgentOSConfig, parent=None):
         super().__init__(parent)
@@ -887,12 +469,9 @@ class ChatPanel(QWidget):
         # ---------------- header row ---------------- #
         head = QHBoxLayout()
         head.setSpacing(8)
-        title = QLabel("\U0001F4AC  Chat")
-        title.setObjectName("panelTitle")
-        head.addWidget(title)
         head.addStretch(1)
 
-        self.think_button = QPushButton("\U0001F9E0 Think")
+        self.think_button = QPushButton("Think")
         self.think_button.setObjectName("thinkToggle")
         self.think_button.setCheckable(True)
         self.think_button.setChecked(True)
@@ -922,6 +501,7 @@ class ChatPanel(QWidget):
         )
         self.new_chat_button.clicked.connect(self.new_chat)
         head.addWidget(self.new_chat_button)
+        self.new_chat_button.setVisible(False)   # lives in the sidebar now
 
         self.chats_button = QPushButton("🕘  Chats")
         self.chats_button.setObjectName("thinkToggle")
@@ -930,6 +510,11 @@ class ChatPanel(QWidget):
         )
         self.chats_button.clicked.connect(self._open_chats_menu)
         head.addWidget(self.chats_button)
+        self.chats_button.setVisible(False)      # sidebar "Recents" replaces it
+
+        # No "Files" show/hide toggle. The files column is always on the left
+        # (see _home_page) -- a toggle that hides it only ever produced the
+        # "I clicked a file and nothing happened" confusion.
         root.addLayout(head)
 
         # ---------------- live session strip ---------------- #
@@ -939,7 +524,7 @@ class ChatPanel(QWidget):
             "Current task/chat. Click to rename it."
         )
         self.session_title_label.clicked.connect(self._rename_current_chat)
-        root.addWidget(self.session_title_label)
+        head.insertWidget(0, self.session_title_label)
 
         # ---------------- live HUD ---------------- #
         self.hud = QFrame()
@@ -989,62 +574,64 @@ class ChatPanel(QWidget):
         self.chat_scroll.setWidget(self.chat_log)
         root.addWidget(self.chat_scroll, stretch=1)
 
-        # ---------------- controls ---------------- #
-        folder_row = QHBoxLayout()
-        folder_row.setSpacing(8)
-        folder_label = QLabel("Project:")
-        folder_label.setObjectName("hintLabel")
-        folder_row.addWidget(folder_label)
+        # ---------------- composer (Claude Code style) ---------------- #
+        self.composer = QFrame()
+        self.composer.setObjectName("composer")
+        comp = QVBoxLayout(self.composer)
+        comp.setContentsMargins(14, 10, 10, 10)
+        comp.setSpacing(6)
+
+        self.input = ChatInput()
+        self.input.setPlaceholderText("Message the planner\u2026   $ command   /help")
+        self.input.setToolTip(
+            "Type and press Enter \u2014 the planner answers, and if you asked for a "
+            "build it dispatches the workers.\n"
+            "\u2022  @file   attach a file\n"
+            "\u2022  $ cmd   run a terminal command\n"
+            "\u2022  /help   list every command\n"
+            "Shift+Enter makes a new line."
+        )
+        self.input.submitted.connect(self._on_send)
+        self._setup_tag_completer()
+        comp.addWidget(self.input)
+
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
         self.project_input = QLineEdit("generated_project")
-        self.project_input.setPlaceholderText("project folder name")
-        self.project_input.setMaximumWidth(180)
+        self.project_input.setObjectName("projectInput")
+        self.project_input.setPlaceholderText("project folder")
+        self.project_input.setMinimumWidth(110)
+        self.project_input.setMaximumWidth(150)
         self.project_input.setToolTip(
             "Folder name the project is created in, inside your projects folder."
         )
-        folder_row.addWidget(self.project_input)
-        self.folder_button = QPushButton("\U0001F4C2 Folder\u2026")
+        bar.addWidget(self.project_input)
+        self.folder_button = QPushButton("Folder\u2026")
         self.folder_button.setObjectName("thinkToggle")
         self.folder_button.setToolTip(
             "Choose the folder where projects are created or opened.\n"
             "Chat and runs only work once a folder is selected."
         )
         self.folder_button.clicked.connect(self.choose_folder_requested.emit)
-        folder_row.addWidget(self.folder_button)
-        folder_row.addStretch(1)
-        root.addLayout(folder_row)
+        bar.addWidget(self.folder_button)
+        bar.addStretch(1)
 
-        input_row = QHBoxLayout()
-        input_row.setSpacing(8)
-        self.input = ChatInput()
-        self.input.setPlaceholderText(
-            "Message the planner\u2026   $ command   /help"
-        )
-        self.input.setToolTip(
-            "Just type and press Enter \u2014 the planner answers, and if you "
-            "asked for a real build it dispatches the workers automatically.\n"
-            "\u2022  @file   attach a file (its path + contents go to the model)\n"
-            "\u2022  $ cmd   run a terminal command on this PC  (e.g. $ pytest -q)\n"
-            "\u2022  /help   list every command\n"
-            "Shift+Enter makes a new line. The box grows as you type."
-        )
-        self.input.submitted.connect(self._on_send)
-        self._setup_tag_completer()
-
-        self.send_button = QPushButton("Send \u21B5")
-        self.send_button.setObjectName("primaryButton")
+        self.send_button = QPushButton("\u2191")
+        self.send_button.setObjectName("sendButton")
+        self.send_button.setFixedSize(32, 32)
+        self.send_button.setCursor(Qt.CursorShape.PointingHandCursor)
         self.send_button.setToolTip(
-            "Ask the planner. If your message is a build/fix request it "
-            "dispatches the workers to do it \u2014 one click, no guessing."
+            "Send. A build/fix request dispatches the workers automatically."
         )
         self.send_button.clicked.connect(self._on_send)
+        bar.addWidget(self.send_button)
+        comp.addLayout(bar)
+        root.addWidget(self.composer)
 
-        input_row.addWidget(self.input, stretch=1)
-        input_row.addWidget(self.send_button,
-                            alignment=Qt.AlignmentFlag.AlignBottom)
-        root.addLayout(input_row)
-
-        # One underlined line under the chat box: the model + role that is
-        # answering. Clicking the text opens its menu -- no chips, no boxes.
+        # The planner model is just one underlined line under the chat box --
+        # no pill, no box, no URL. Clicking the text is the only way in.
+        model_row = QHBoxLayout()
+        model_row.setContentsMargins(8, 0, 8, 0)
         self.model_chip = ClickableLabel("")
         self.model_chip.setObjectName("modelLink")
         self.model_chip.setToolTip(
@@ -1052,7 +639,9 @@ class ChatPanel(QWidget):
             "Click to switch role or model; saved to Settings too."
         )
         self.model_chip.clicked.connect(self._open_model_menu)
-        root.addWidget(self.model_chip)
+        model_row.addWidget(self.model_chip)
+        model_row.addStretch(1)
+        root.addLayout(model_row)
 
         helper = QLabel(
             "Enter = send \u00B7 Shift+Enter = new line \u00B7 @ = attach a file "
@@ -1060,6 +649,7 @@ class ChatPanel(QWidget):
         )
         helper.setObjectName("hintLabel")
         helper.setWordWrap(True)
+        helper.setAlignment(Qt.AlignmentFlag.AlignCenter)
         helper.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         root.addWidget(helper)
 
@@ -1072,7 +662,7 @@ class ChatPanel(QWidget):
                 "Welcome to AquilaOS. Chat normally \u2014 you don't need perfect "
                 "prompts. Ask the planner anything; if you want something built or "
                 "fixed it plans it and the worker agents write the files, which then "
-                "open in the code column (middle). Use \u201CNew chat\u201D for a new "
+                "open in the code panel. Use \u201CNew chat\u201D for a new "
                 "task \u2014 every task keeps its own conversation."
             )
         self.set_ready(False)
@@ -1170,6 +760,14 @@ class ChatPanel(QWidget):
             f"QFrame#chatHud QLabel {{ font-size: {max(8.0, base - 1.0):.1f}px; }}"
         )
 
+    def resizeEvent(self, event):
+        """Keep the conversation in a centred reading column, like Claude."""
+        super().resizeEvent(event)
+        side = max(20, (self.width() - 780) // 2)
+        lay = self.layout()
+        if lay is not None:
+            lay.setContentsMargins(side, 0, side, 0)
+
     @staticmethod
     def _selectable(widget: QWidget):
         """Let the user drag-select and Ctrl+C from this widget."""
@@ -1209,12 +807,15 @@ class ChatPanel(QWidget):
             {"role": role, "text": text, "who": who}
         )
         self.session_store.save(self.session)
+        self.sessions_changed.emit()
 
     def _clear_chat_view(self):
         while self.chat_layout.count() > 1:      # keep the trailing stretch
             item = self.chat_layout.takeAt(0)
             w = item.widget()
             if w is not None:
+                w.hide()
+                w.setParent(None)
                 w.deleteLater()
         self._thinking_cards.clear()
         self._transcript.clear()
@@ -1224,7 +825,7 @@ class ChatPanel(QWidget):
     def _render_session(self):
         """Show the current session's history (and nothing from others)."""
         self.session_title_label.setText(
-            f"\U0001F4AC {self.session.get('title', 'New task')}"
+            self.session.get("title", "New task")
         )
         project = self.session.get("project")
         if project:
@@ -1244,6 +845,7 @@ class ChatPanel(QWidget):
         finally:
             self._replaying = False
         self.set_ready(self._ready)
+        self.sessions_changed.emit()
 
     def new_chat(self):
         """Fresh task -> fresh conversation; the old one stays in Chats."""
@@ -1334,9 +936,17 @@ class ChatPanel(QWidget):
         name.setObjectName("bubbleNameMine" if mine else "bubbleName")
         body = QLabel(text)
         body.setWordWrap(True)
-        body.setMaximumWidth(520)
+        body.setMaximumWidth(680)
+        if mine:
+            # your bubble hugs its text (measured generously: the stylesheet
+            # font is applied after this point, so allow some slack)
+            _fm = QFontMetrics(body.font())
+            body.setMinimumWidth(min(680, int(_fm.boundingRect(
+                0, 0, 680, 100000, Qt.TextFlag.TextWordWrap, text).width() * 1.18) + 8))
         self._selectable(name)
         self._selectable(body)
+        if mine:
+            name.hide()
         inner.addWidget(name)
         inner.addWidget(body)
 
@@ -1344,8 +954,7 @@ class ChatPanel(QWidget):
             row.addStretch(1)
             row.addWidget(bubble)
         else:
-            row.addWidget(bubble)
-            row.addStretch(1)
+            row.addWidget(bubble, 1)     # assistant text uses the full column
         # right-click copies just this message
         self._attach_copy_menu(bubble, lambda: f"{who}: {text}")
         self._transcript.append(f"{who}: {text}")
@@ -1461,7 +1070,7 @@ class ChatPanel(QWidget):
         self._hud_base = text
         self._hud_dots = 0
         self.hud_activity.setText(text)
-        self.hud_dot.setStyleSheet("color: #7c5cff;")
+        self.hud_dot.setStyleSheet("color: #D97757;")
         if text:
             self._hud_timer.start()
         else:
@@ -1702,8 +1311,9 @@ class ChatPanel(QWidget):
             self.session["title"] = text[:60]
             self.session_store.save(self.session)
             self.session_title_label.setText(
-                f"\U0001F4AC {self.session['title']}"
+                self.session["title"]
             )
+            self.sessions_changed.emit()
         if not self.session.get("project") and self.project_input.text().strip():
             self.session["project"] = self.project_input.text().strip()
             self.session_store.save(self.session)
@@ -1766,7 +1376,7 @@ class ChatPanel(QWidget):
                 self.session["title"] = goal[:60]
                 self.session_store.save(self.session)
                 self.session_title_label.setText(
-                    f"\U0001F4AC {self.session['title']}"
+                    self.session["title"]
                 )
             self.run_requested.emit(goal)
         elif had_code:
@@ -1823,12 +1433,12 @@ class PythonHighlighter(QSyntaxHighlighter):
         return fmt
 
     def highlightBlock(self, text: str):
-        keyword = self._fmt("#c678dd")
-        builtin = self._fmt("#61afef")
-        string = self._fmt("#98c379")
-        comment = self._fmt("#5c6370")
-        number = self._fmt("#d19a66")
-        decorator = self._fmt("#c678dd")
+        keyword = self._fmt("#D97757")
+        builtin = self._fmt("#8AB4D8")
+        string = self._fmt("#A8C686")
+        comment = self._fmt("#7A786F")
+        number = self._fmt("#E0B070")
+        decorator = self._fmt("#D97757")
 
         in_string = self.previousBlockState() == 1
         span_start = 0 if in_string else None
@@ -1908,8 +1518,8 @@ class CodeEditor(QPlainTextEdit):
 
     def line_number_paint_event(self, event):
         painter = QPainter(self._line_area)
-        painter.fillRect(event.rect(), QColor("#0a0c12"))
-        painter.setPen(QColor("#5b6172"))
+        painter.fillRect(event.rect(), QColor("#1F1E1D"))
+        painter.setPen(QColor("#6F6D66"))
         block = self.firstVisibleBlock()
         block_number = block.blockNumber()
         top = round(self.blockBoundingGeometry(block)
@@ -2904,7 +2514,7 @@ class Dashboard(QMainWindow):
         geo = self.geometry()
         state = {
             "geometry": [geo.x(), geo.y(), geo.width(), geo.height()],
-            "splitter": self.home_split.sizes() if hasattr(self, "home_split") else [],
+            "splitter_v3": self.home_split.sizes() if hasattr(self, "home_split") else [],
             "zoom": getattr(self, "ui_zoom", 1.0),
         }
         save_ui_state(state)
@@ -2937,66 +2547,75 @@ class Dashboard(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
+        root = QHBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(self._header_bar())
+        root.addWidget(self._header_bar())      # the sidebar
 
-        # Header sections; Home is the default one. (The file browser lives
-        # inside Home -- files above, file contents below -- so there is no
-        # separate Files section to get lost in.)
+        main = QWidget()
+        col = QVBoxLayout(main)
+        col.setContentsMargins(0, 0, 0, 0)
+        col.setSpacing(0)
+
+        # Sections; Home is the default one. (Files + code live inside Home.)
         self.stack = QStackedWidget()
         self.stack.addWidget(self._home_page())    # 0 -- Home (default)
         self.stack.addWidget(self._tasks_page())   # 1 -- Tasks
         self.stack.currentChanged.connect(self._sync_nav)
-        root.addWidget(self.stack, stretch=1)
+        col.addWidget(self.stack, stretch=1)
 
         self.status_label = QLabel("\u25CF Idle")
         self.status_label.setObjectName("statusBar")
-        self.status_label.setStyleSheet("color: #8b949e;")
-        root.addWidget(self.status_label)
+        self.status_label.setStyleSheet("color: #9C9A92;")
+        col.addWidget(self.status_label)
+        root.addWidget(main, stretch=1)
+
+        self.chat_panel.sessions_changed.connect(self._refresh_recents)
+        self._refresh_recents()
 
     def _header_bar(self):
-        """Top bar: brand block optically centered (no glitch between the
-        mark, the name and the subtitle), section nav pills in the middle,
-        Settings on the right."""
+        """Left sidebar (Claude Code desktop style): brand, New chat, section
+        nav, Recents (all saved chats), Settings pinned to the bottom."""
         bar = QWidget()
-        bar.setObjectName("headerBar")
-        bar.setFixedHeight(66)
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(22, 0, 22, 0)
-        layout.setSpacing(8)
+        bar.setObjectName("sidebar")
+        bar.setFixedWidth(264)
+        layout = QVBoxLayout(bar)
+        layout.setContentsMargins(12, 14, 12, 12)
+        layout.setSpacing(4)
 
-        # Letter mark instead of a special glyph -- renders identically on
-        # every system (missing-symbol "tofu" boxes caused header glitches).
         logo = QFrame()
         logo.setObjectName("logoMark")
-        logo.setFixedSize(36, 36)
+        logo.setFixedSize(30, 30)
         logo_layout = QVBoxLayout(logo)
         logo_layout.setContentsMargins(0, 0, 0, 0)
         logo_letter = QLabel("A")
         logo_letter.setObjectName("logoLetter")
         logo_letter.setAlignment(Qt.AlignmentFlag.AlignCenter)
         logo_layout.addWidget(logo_letter)
-
-        title_box = QVBoxLayout()
-        title_box.setSpacing(0)
-        title_box.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         title = QLabel("AgentOS")
         title.setObjectName("headerTitle")
         subtitle = QLabel("Autonomous AI Agent Platform")
         subtitle.setObjectName("headerSubtitle")
+        title_box = QVBoxLayout()
+        title_box.setSpacing(0)
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
-
         brand = QHBoxLayout()
         brand.setSpacing(10)
-        brand.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        brand.setContentsMargins(4, 0, 0, 0)
         brand.addWidget(logo)
         brand.addLayout(title_box)
+        brand.addStretch(1)
         layout.addLayout(brand)
-        layout.addStretch(1)
+        layout.addSpacing(12)
+
+        new_btn = QPushButton("\uFF0B  New chat")
+        new_btn.setObjectName("newChatButton")
+        new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_btn.clicked.connect(self._sidebar_new_chat)
+        layout.addWidget(new_btn)
+        layout.addSpacing(6)
 
         self.nav_group = QButtonGroup(self)
         self.nav_buttons = {}
@@ -3007,16 +2626,66 @@ class Dashboard(QMainWindow):
             btn.setCursor(Qt.CursorShape.PointingHandCursor)
             self.nav_group.addButton(btn, idx)
             self.nav_buttons[label] = btn
-            layout.addWidget(btn, 0, Qt.AlignmentFlag.AlignVCenter)
+            layout.addWidget(btn)
         self.nav_group.buttonClicked.connect(self._on_nav)
         self.nav_buttons["Home"].setChecked(True)
+
+        layout.addSpacing(10)
+        recents_label = QLabel("Recents")
+        recents_label.setObjectName("sidebarSection")
+        layout.addWidget(recents_label)
+
+        self.recents = QListWidget()
+        self.recents.setObjectName("recentsList")
+        self.recents.setFrameShape(QFrame.Shape.NoFrame)
+        self.recents.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.recents.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.recents.itemClicked.connect(self._sidebar_open_chat)
+        self.recents.customContextMenuRequested.connect(self._recents_menu)
+        layout.addWidget(self.recents, stretch=1)
 
         settings_btn = QPushButton("\u2699  Settings")
         settings_btn.setObjectName("navButton")
         settings_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         settings_btn.clicked.connect(self._on_settings_clicked)
-        layout.addWidget(settings_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(settings_btn)
         return bar
+
+    # ---------------- sidebar: recents ---------------- #
+
+    def _refresh_recents(self):
+        if not hasattr(self, "recents") or not hasattr(self, "chat_panel"):
+            return
+        current = self.chat_panel.session.get("id")
+        self.recents.blockSignals(True)
+        self.recents.clear()
+        for info in self.chat_panel.session_store.list()[:60]:
+            item = QListWidgetItem((info.get("title") or "New task")[:44])
+            item.setData(Qt.ItemDataRole.UserRole, info["id"])
+            item.setToolTip(time.strftime("%Y-%m-%d %H:%M",
+                                          time.localtime(info.get("updated") or 0)))
+            self.recents.addItem(item)
+            if info["id"] == current:
+                self.recents.setCurrentItem(item)
+        self.recents.blockSignals(False)
+
+    def _sidebar_new_chat(self):
+        self.stack.setCurrentIndex(0)
+        self.chat_panel.new_chat()
+
+    def _sidebar_open_chat(self, item):
+        self.stack.setCurrentIndex(0)
+        self.chat_panel.switch_chat(item.data(Qt.ItemDataRole.UserRole))
+
+    def _recents_menu(self, pos):
+        item = self.recents.itemAt(pos)
+        if item is None:
+            return
+        self.chat_panel.switch_chat(item.data(Qt.ItemDataRole.UserRole))
+        menu = QMenu(self)
+        menu.addAction("Rename\u2026", self.chat_panel._rename_current_chat)
+        menu.addAction("Delete", self.chat_panel._delete_current_chat)
+        menu.exec(self.recents.viewport().mapToGlobal(pos))
 
     def _on_nav(self, btn):
         """Header nav: switch the main stack to the chosen section."""
@@ -3044,7 +2713,7 @@ class Dashboard(QMainWindow):
         """
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(18, 16, 18, 12)
+        layout.setContentsMargins(0, 14, 14, 14)
         layout.setSpacing(0)
 
         split = QSplitter(Qt.Orientation.Horizontal)
@@ -3065,16 +2734,19 @@ class Dashboard(QMainWindow):
         self.chat_panel.run_requested.connect(self._on_run_requested)
         self.chat_panel.choose_folder_requested.connect(self._choose_projects_folder)
         self.chat_panel.command_requested.connect(self._on_command_requested)
+        # Order matters and is part of the contract: files on the LEFT, the
+        # coding center in the MIDDLE, chat on the RIGHT.
         split.addWidget(self.home_files)
         split.addWidget(self.home_tabs)
         split.addWidget(self.chat_panel)
-        # LEFT and RIGHT keep their width; the MIDDLE code column is the one
-        # that grows/shrinks -- and it disappears entirely when no file is
-        # open, handing its space to the chat.
+        self.chat_panel.files_toggled.connect(self.home_files.setVisible)
+        # The files column keeps its width (stretch 0) and the code column is
+        # the one that grows/shrinks -- it disappears entirely when no file is
+        # open, handing its space back to the chat.
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setStretchFactor(2, 0)
-        sizes = self.ui_state.get("splitter") or [280, 520, 560]
+        split.setStretchFactor(2, 1)
+        sizes = self.ui_state.get("splitter_v3") or [280, 520, 760]
         split.setSizes(sizes)
         layout.addWidget(split, stretch=1)
         self._sync_code_pane(restoring=True)
@@ -3386,7 +3058,7 @@ class Dashboard(QMainWindow):
 
         self.chat_panel.set_activity("Planner is planning the goal")
         self.status_label.setText("\u25CF Running...")
-        self.status_label.setStyleSheet("color: #58a6ff;")
+        self.status_label.setStyleSheet("color: #D97757;")
         self.log_view.clear()
         self.task_table.setRowCount(0)
         self.memory_table.setRowCount(0)
@@ -3482,7 +3154,7 @@ class Dashboard(QMainWindow):
 
         if kind == "action_started":
             agent = evt["agent"]
-            self._set_agent_status(agent, "working", "#58a6ff")
+            self._set_agent_status(agent, "working", "#D97757")
             row = self.task_table.rowCount()
             self.task_table.insertRow(row)
             self.task_table.setItem(row, 0, QTableWidgetItem(evt["action_id"]))
@@ -3513,14 +3185,14 @@ class Dashboard(QMainWindow):
             if row is not None:
                 existing = self.task_table.item(row, 4).text() if self.task_table.item(row, 4) else ""
                 self.task_table.setItem(row, 4, QTableWidgetItem(f"{existing} | security: {evt['status']}".strip(" |")))
-            self._set_agent_status("security", evt["status"], STATUS_COLORS.get(evt["status"], "#8b949e"))
+            self._set_agent_status("security", evt["status"], STATUS_COLORS.get(evt["status"], "#9C9A92"))
 
         elif kind == "action_started" or kind == "action_done":
             pass  # handled above
 
         for role in self.agent_status_labels:
             if kind == "action_started" and evt.get("agent") == role:
-                self._set_agent_status(role, "working", "#58a6ff")
+                self._set_agent_status(role, "working", "#D97757")
             if kind == "action_done":
                 aid = evt.get("action_id")
                 row = self.action_rows.get(aid)
@@ -3536,14 +3208,14 @@ class Dashboard(QMainWindow):
 
     def _colored_item(self, status: str) -> QTableWidgetItem:
         item = QTableWidgetItem(status)
-        color = STATUS_COLORS.get(status, "#8b949e")
+        color = STATUS_COLORS.get(status, "#9C9A92")
         item.setForeground(QColor(color))
         return item
 
     def _on_finished(self, report: dict):
         self.chat_panel.set_idle(f"Finished: {report.get('final_status', 'unknown')}")
         status = report.get("final_status", "unknown")
-        color = STATUS_COLORS.get(status, "#8b949e")
+        color = STATUS_COLORS.get(status, "#9C9A92")
         self.status_label.setStyleSheet(f"color: {color};")
         self.status_label.setText(
             f"\u25CF Finished: {status} | tests_passed={report.get('tests_passed')} | "
