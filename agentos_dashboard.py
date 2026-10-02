@@ -34,6 +34,7 @@ copied (Ctrl+C, right-click menu, or the Copy button).
 import sys
 import os
 import re
+import time
 import json
 import yaml
 import threading
@@ -83,6 +84,7 @@ from PyQt6.QtWidgets import (
 )
 
 from agentos.config import AgentOSConfig
+from agentos.sessions import SessionStore
 from agentos.llm.factory import build_provider, list_models, REGISTRY as PROVIDER_REGISTRY
 from agentos.brain import CoreBrain
 from agentos.agents import AGENT_REGISTRY
@@ -248,6 +250,15 @@ MODERN_STYLESHEET = f"""
         background-color: #0f121a;
         border: 1px solid #232735;
         border-radius: 14px;
+    }}
+
+    /* thin rule inside a card (files tree / open files) */
+    QFrame#cardSeparator {{
+        border: none;
+        border-top: 1px solid #232735;
+        background: transparent;
+        max-height: 1px;
+        min-height: 1px;
     }}
 
     /* ---- Live HUD: what is happening right now + line deltas ---- */
@@ -437,6 +448,27 @@ MODERN_STYLESHEET = f"""
         font-size: 11.5px;
         font-weight: 600;
     }}
+    /* Underlined plain-text links: model chooser (under the chat box) and
+       the current task name (under the header). No boxes, no pills. */
+    QLabel#modelLink {{
+        color: #9aa3c0;
+        font-size: 11.5px;
+        text-decoration: underline;
+        padding: 0px;
+        background: transparent;
+        border: none;
+    }}
+    QLabel#modelLink:hover {{ color: #b9a8ff; }}
+    QLabel#sessionTitle {{
+        color: #7d8296;
+        font-size: 12px;
+        font-weight: 600;
+        text-decoration: underline;
+        padding: 0px;
+        background: transparent;
+        border: none;
+    }}
+    QLabel#sessionTitle:hover {{ color: #9aa3c0; }}
     QLabel#agentPill {{
         background-color: #12151d;
         border: 1px solid #202331;
@@ -822,6 +854,7 @@ class ChatPanel(QWidget):
         self._busy = False
         self._warned_about_model = False
         self._ready = False
+        self._replaying = False
         self._transcript: list[str] = []
         self._thinking_cards: list[QWidget] = []
         self._added = 0
@@ -832,6 +865,14 @@ class ChatPanel(QWidget):
         self.workspace_tabs = None
         self.project_root = ""
         self.last_tagged: list[str] = []
+        # One conversation = one task/project. The store keeps every chat on
+        # disk; messages are persisted as they are shown, and only THIS
+        # session's history is ever sent to the model.
+        self.session_store = SessionStore()
+        self.session: dict = self.session_store.list() and (
+            self.session_store.load(self.session_store.list()[0]["id"])
+            or self.session_store.create()
+        ) or self.session_store.create()
         # Live catalog for the role's provider: used to render the model
         # showcase and to fill the "switch model" menu.
         self._catalog: list[str] = []
@@ -863,6 +904,8 @@ class ChatPanel(QWidget):
         self.think_button.toggled.connect(self._on_think_toggled)
         head.addWidget(self.think_button)
 
+        # Planner/worker chooser + model info are NOT shown up here -- they
+        # live as one underlined link under the chat box (see below).
         self.role_combo = QComboBox()
         self.role_combo.setObjectName("roleCombo")
         self.role_combo.setToolTip(
@@ -870,18 +913,33 @@ class ChatPanel(QWidget):
             "and dispatches the work) or a Worker model."
         )
         self.role_combo.currentIndexChanged.connect(self._refresh_role_chip)
-        head.addWidget(self.role_combo)
 
-        self.model_chip = ClickableLabel("")
-        self.model_chip.setObjectName("modelChip")
-        self.model_chip.setToolTip(
-            "The model that actually answers here \u2014 auto-detected from your "
-            "API key.\nClick to switch model; the choice is saved, so Settings "
-            "shows it too."
+        self.new_chat_button = QPushButton("＋  New chat")
+        self.new_chat_button.setObjectName("thinkToggle")
+        self.new_chat_button.setToolTip(
+            "Start a fresh task in its own conversation. Each chat keeps its\n"
+            "own history, project and context -- tasks never mix."
         )
-        self.model_chip.clicked.connect(self._open_model_menu)
-        head.addWidget(self.model_chip)
+        self.new_chat_button.clicked.connect(self.new_chat)
+        head.addWidget(self.new_chat_button)
+
+        self.chats_button = QPushButton("🕘  Chats")
+        self.chats_button.setObjectName("thinkToggle")
+        self.chats_button.setToolTip(
+            "Open a previous conversation (one per task/project)."
+        )
+        self.chats_button.clicked.connect(self._open_chats_menu)
+        head.addWidget(self.chats_button)
         root.addLayout(head)
+
+        # ---------------- live session strip ---------------- #
+        self.session_title_label = ClickableLabel("")
+        self.session_title_label.setObjectName("sessionTitle")
+        self.session_title_label.setToolTip(
+            "Current task/chat. Click to rename it."
+        )
+        self.session_title_label.clicked.connect(self._rename_current_chat)
+        root.addWidget(self.session_title_label)
 
         # ---------------- live HUD ---------------- #
         self.hud = QFrame()
@@ -985,10 +1043,20 @@ class ChatPanel(QWidget):
                             alignment=Qt.AlignmentFlag.AlignBottom)
         root.addLayout(input_row)
 
+        # One underlined line under the chat box: the model + role that is
+        # answering. Clicking the text opens its menu -- no chips, no boxes.
+        self.model_chip = ClickableLabel("")
+        self.model_chip.setObjectName("modelLink")
+        self.model_chip.setToolTip(
+            "The model answering here (auto-detected from your API key).\n"
+            "Click to switch role or model; saved to Settings too."
+        )
+        self.model_chip.clicked.connect(self._open_model_menu)
+        root.addWidget(self.model_chip)
+
         helper = QLabel(
             "Enter = send \u00B7 Shift+Enter = new line \u00B7 @ = attach a file "
-            "\u00B7 $ = run a terminal command \u00B7 /help = command list "
-            "\u00B7 drag over any text to copy \u00B7 Ctrl +/- zooms this chat"
+            "\u00B7 $ = run a terminal command \u00B7 /help = command list"
         )
         helper.setObjectName("hintLabel")
         helper.setWordWrap(True)
@@ -996,12 +1064,17 @@ class ChatPanel(QWidget):
         root.addWidget(helper)
 
         self.refresh_roles()
-        self.append_system(
-            "Welcome to AquilaOS. Chat normally \u2014 you don't need perfect "
-            "prompts. Ask the planner anything; if you want something built or "
-            "fixed it plans it and the worker agents write the files, which then "
-            "open in the code column (middle)."
-        )
+        self._render_session()
+        # Welcome only for a brand-new chat -- never injected into a restored
+        # conversation's history.
+        if not self.session.get("messages"):
+            self.append_system(
+                "Welcome to AquilaOS. Chat normally \u2014 you don't need perfect "
+                "prompts. Ask the planner anything; if you want something built or "
+                "fixed it plans it and the worker agents write the files, which then "
+                "open in the code column (middle). Use \u201CNew chat\u201D for a new "
+                "task \u2014 every task keeps its own conversation."
+            )
         self.set_ready(False)
 
     # ---------------- file tagging (@file) ---------------- #
@@ -1126,6 +1199,122 @@ class ChatPanel(QWidget):
         self._to_clipboard("\n".join(self._transcript))
         self.append_system("\u29C9 Conversation copied to the clipboard.")
 
+    # ---------------- chat sessions (one per task/project) ---------------- #
+
+    def _record(self, role: str, text: str, who: str = ""):
+        """Persist one message into the CURRENT session only."""
+        if self._replaying or not text:
+            return
+        self.session.setdefault("messages", []).append(
+            {"role": role, "text": text, "who": who}
+        )
+        self.session_store.save(self.session)
+
+    def _clear_chat_view(self):
+        while self.chat_layout.count() > 1:      # keep the trailing stretch
+            item = self.chat_layout.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+        self._thinking_cards.clear()
+        self._transcript.clear()
+        self._added = self._removed = 0
+        self._refresh_diff()
+
+    def _render_session(self):
+        """Show the current session's history (and nothing from others)."""
+        self.session_title_label.setText(
+            f"\U0001F4AC {self.session.get('title', 'New task')}"
+        )
+        project = self.session.get("project")
+        if project:
+            self.project_input.setText(project)
+        self._clear_chat_view()
+        self._replaying = True
+        try:
+            for msg in self.session.get("messages", []):
+                role = msg.get("role")
+                if role == "user":
+                    self._append_bubble("You", msg.get("text", ""), mine=True)
+                elif role == "assistant":
+                    who = msg.get("who") or "assistant"
+                    self._append_bubble(who, msg.get("text", ""), mine=False)
+                elif role == "system":
+                    self.append_system(msg.get("text", ""))
+        finally:
+            self._replaying = False
+        self.set_ready(self._ready)
+
+    def new_chat(self):
+        """Fresh task -> fresh conversation; the old one stays in Chats."""
+        self.session = self.session_store.create()
+        if self.project_root:
+            self.session["project"] = os.path.basename(self.project_root)
+            self.session_store.save(self.session)
+        self._render_session()
+        self.append_system(
+            "\u2795 New chat started \u2014 this conversation is its own task. "
+            "History, project and context stay separate from every other chat."
+        )
+
+    def switch_chat(self, session_id: str):
+        if session_id == self.session.get("id"):
+            return
+        session = self.session_store.load(session_id)
+        if not session:
+            self.append_system("\u26A0 That chat could not be opened.")
+            return
+        self.session = session
+        self._render_session()
+        self.append_system(
+            f"\U0001F4C4 Opened \u2018{session.get('title', 'New task')}\u2019 "
+            "\u2014 only this task's history is in context."
+        )
+
+    def _open_chats_menu(self):
+        menu = QMenu(self)
+        menu.addAction("＋ New chat", self.new_chat)
+        sessions = self.session_store.list()
+        if sessions:
+            menu.addSeparator()
+            for info in sessions[:40]:
+                title = (info.get("title") or "New task")[:48]
+                stamp = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(info.get("updated") or 0)
+                )
+                marker = "  \u2713" if info["id"] == self.session.get("id") else ""
+                act = menu.addAction(f"{title}   \u00b7 {stamp}{marker}")
+                act.triggered.connect(
+                    lambda _=False, sid=info["id"]: self.switch_chat(sid)
+                )
+            menu.addSeparator()
+            menu.addAction("Rename current chat\u2026", self._rename_current_chat)
+            menu.addAction("Delete current chat",
+                           lambda: self._delete_current_chat())
+        menu.exec(self.chats_button.mapToGlobal(
+            self.chats_button.rect().bottomLeft()))
+
+    def _rename_current_chat(self):
+        title, ok = QInputDialog.getText(
+            self, "Rename chat", "Task name:", QLineEdit.EchoMode.Normal,
+            self.session.get("title", "New task"),
+        )
+        if not ok or not title.strip():
+            return
+        self.session["title"] = title.strip()
+        self.session_store.save(self.session)
+        self._render_session()
+
+    def _delete_current_chat(self):
+        current_id = self.session.get("id")
+        self.session_store.delete(current_id)
+        remaining = [s for s in self.session_store.list()
+                     if s["id"] != current_id]
+        if remaining:
+            self.switch_chat(remaining[0]["id"])
+        else:
+            self.new_chat()
+
     def _insert(self, widget: QWidget):
         self.chat_layout.insertWidget(self.chat_layout.count() - 1, widget)
         self._scroll_chat_bottom()
@@ -1161,6 +1350,7 @@ class ChatPanel(QWidget):
         self._attach_copy_menu(bubble, lambda: f"{who}: {text}")
         self._transcript.append(f"{who}: {text}")
         self._insert(wrap)
+        self._record("assistant" if not mine else "user", text, who=who)
 
     def append_system(self, text: str):
         lbl = QLabel(text)
@@ -1171,6 +1361,7 @@ class ChatPanel(QWidget):
         self._attach_copy_menu(lbl, lambda: text, "line")
         self._transcript.append(f"-- {text}")
         self._insert(lbl)
+        self._record("system", text)
 
     def append_diff_line(self, path: str, added: int, removed: int):
         """Per-file '+12 / -2' line, green added / red removed."""
@@ -1331,8 +1522,7 @@ class ChatPanel(QWidget):
         provider = spec.get("provider", "?")
         pinned = (spec.get("model") or "auto").strip() or "auto"
         shown = self._resolved or pinned
-        arrow = " \u25BE" if provider in PROVIDER_REGISTRY and provider != "mock" else ""
-        self.model_chip.setText(f"{provider} / {shown}{arrow}")
+        self.model_chip.setText(f"{role.capitalize()} \u00b7 {provider} / {shown} \u25BE")
 
     def _start_model_fetch(self):
         """Ask the provider which models this key can reach (off the UI thread)
@@ -1385,7 +1575,8 @@ class ChatPanel(QWidget):
         self._render_chip()
 
     def _open_model_menu(self):
-        """Click the chip -> pick Auto or any model this key can actually call."""
+        """Click the underlined model link -> switch role (the combo left the
+        header) or pick Auto/any model this key can actually call."""
         role = self.role_combo.currentData() or "planner"
         spec = self._spec_for(role)
         provider = spec.get("provider", "?")
@@ -1396,6 +1587,13 @@ class ChatPanel(QWidget):
         if self._resolved:
             live = menu.addAction(f"answering now: {self._resolved}")
             live.setEnabled(False)
+        # role switch -- the Planner/Worker combo is not in the header any more
+        menu.addSeparator()
+        for label, value in (("\U0001F9E0 Answer as Planner", "planner"),
+                             ("\U0001F6E0\uFE0F Answer as Worker", "worker")):
+            mark = "   \u2713" if role == value else ""
+            act = menu.addAction(label + mark)
+            act.triggered.connect(lambda _=False, v=value: self._set_role(v))
         menu.addSeparator()
         auto = menu.addAction("Auto \u2014 let the key/provider decide"
                               + ("   \u2713" if current == "auto" else ""))
@@ -1411,6 +1609,17 @@ class ChatPanel(QWidget):
         menu.addSeparator()
         menu.addAction("Refresh list", self._start_model_fetch)
         menu.exec(self.model_chip.mapToGlobal(self.model_chip.rect().bottomLeft()))
+
+    def role_combo_items(self) -> list:
+        return [self.role_combo.itemData(i) for i in range(self.role_combo.count())]
+
+    def _set_role(self, role: str):
+        idx = self.role_combo.findData(role)
+        if idx >= 0 and idx != self.role_combo.currentIndex():
+            self.role_combo.setCurrentIndex(idx)
+        else:
+            self._refresh_role_chip()
+        self._render_chip()
 
     def _set_role_model(self, model: str):
         """Change the role's model from the chat; persisted, so Settings and
@@ -1487,10 +1696,26 @@ class ChatPanel(QWidget):
         role = self.role_combo.currentData() or "planner"
         spec = dict(getattr(self.config, role, {}) or {})
         self.append_user(text)
+        # Title the chat from the first message (ChatGPT-style), and keep it
+        # tied to this task's project folder.
+        if self.session.get("title") in ("", "New task"):
+            self.session["title"] = text[:60]
+            self.session_store.save(self.session)
+            self.session_title_label.setText(
+                f"\U0001F4AC {self.session['title']}"
+            )
+        if not self.session.get("project") and self.project_input.text().strip():
+            self.session["project"] = self.project_input.text().strip()
+            self.session_store.save(self.session)
         if tags:
             shown = ", ".join(os.path.basename(p) for p in tags[:6])
             self.append_system(f"\U0001F4CE Attached to the message: {shown}")
-        prompt = text + ("\n\n" + self._attachment_block(tags) if tags else "")
+        # Task-scoped context: this chat's title/project/own history only, so
+        # the model can identify and manage THIS task and never mixes chats.
+        context = self.session_store.context_block(self.session)
+        prompt = context + "\n\nUser message: " + text
+        if tags:
+            prompt += "\n\n" + self._attachment_block(tags)
         self.append_system(f"\u2192 {role} is thinking\u2026")
         self.set_activity(f"{role.capitalize()} is thinking")
         warning = self._planner_model_warning()
@@ -1535,6 +1760,14 @@ class ChatPanel(QWidget):
         self._append_bubble(f"{role} \u00B7 {model}", text or "(empty reply)", mine=False)
         if goal:
             self.append_system("Plan ready \u2014 dispatching to the workers\u2026")
+            # The dispatched goal IS this chat's task -- title it accordingly
+            # (only if the user hasn't renamed the chat by hand).
+            if self.session.get("title") in ("", "New task"):
+                self.session["title"] = goal[:60]
+                self.session_store.save(self.session)
+                self.session_title_label.setText(
+                    f"\U0001F4AC {self.session['title']}"
+                )
             self.run_requested.emit(goal)
         elif had_code:
             self.append_system(
@@ -2019,27 +2252,34 @@ class FilesPanel(QWidget):
         self.tree.setMinimumWidth(200)
         self.tree.clicked.connect(self._open_file)
         files_layout.addWidget(self.tree, stretch=1)
-        layout.addWidget(files_card, stretch=3)
 
-        # ---- lower card: which files are open right now ----
-        open_card = QFrame()
-        open_card.setObjectName("panelCard")
-        open_layout = QVBoxLayout(open_card)
-        open_layout.setContentsMargins(12, 10, 12, 12)
+        # ---- open files live INSIDE the same card ----
+        # They used to be a second card of their own, which left a big empty
+        # box under the tree most of the time. Now the section only appears
+        # when something is actually open, so the column never has dead space.
+        self.open_section = QWidget()
+        open_layout = QVBoxLayout(self.open_section)
+        open_layout.setContentsMargins(0, 8, 0, 0)
         open_layout.setSpacing(6)
+
+        sep = QFrame()
+        sep.setObjectName("cardSeparator")
+        sep.setFrameShape(QFrame.Shape.HLine)
+        open_layout.addWidget(sep)
 
         open_title = QLabel("\U0001F4C4  Open files")
         open_title.setObjectName("panelTitle")
         self.open_title = open_title
         open_layout.addWidget(open_title)
 
-        self.open_files_label = QLabel("No open files yet \u2014 click one above,\n"
-                                       "or wait for the workers to write one.")
+        self.open_files_label = QLabel("")
         self.open_files_label.setObjectName("hintLabel")
         self.open_files_label.setWordWrap(True)
         open_layout.addWidget(self.open_files_label)
-        open_layout.addStretch(1)
-        layout.addWidget(open_card, stretch=0)
+
+        self.open_section.setVisible(False)
+        files_layout.addWidget(self.open_section)
+        layout.addWidget(files_card, stretch=1)
 
     # ---------------- helpers ---------------- #
 
@@ -2064,14 +2304,13 @@ class FilesPanel(QWidget):
         )
 
     def update_open_list(self, paths: list[str]):
-        """List which files are currently open in the coding center."""
-        self.open_title.setText(
-            f"\U0001F4C4  Open files ({len(paths)})" if paths else "\U0001F4C4  Open files"
-        )
-        if not paths:
-            self.open_files_label.setText("No open files yet \u2014 click one above,\n"
-                                          "or wait for the workers to write one.")
-            return
+        """List which files are currently open in the coding center.
+
+        The section is hidden when nothing is open, so an empty left column
+        is just the folder tree -- no dead card eating half the screen.
+        """
+        self.open_section.setVisible(bool(paths))
+        self.open_title.setText(f"\U0001F4C4  Open files ({len(paths)})")
         self.open_files_label.setText("\n".join(f"\u2022 {p}" for p in paths[:8]))
 
     def _open_file(self, index):
@@ -3014,15 +3253,17 @@ class Dashboard(QMainWindow):
         )
 
     def _model_manager_box(self):
-        box = QGroupBox("\U0001F9E9  Model Manager")
+        # The model picker lives under the chat box now; here we only need a
+        # one-line readout, not a whole card of pills.
+        box = QGroupBox("\U0001F9E9  Models")
         box.setObjectName("sectionCard")
         layout = QVBoxLayout(box)
         layout.setSpacing(4)
         row = QHBoxLayout()
         self.planner_model_label = QLabel()
-        self.planner_model_label.setObjectName("modelChip")
+        self.planner_model_label.setObjectName("hintLabel")
         self.worker_model_label = QLabel()
-        self.worker_model_label.setObjectName("modelChip")
+        self.worker_model_label.setObjectName("hintLabel")
         row.addWidget(self.planner_model_label)
         row.addWidget(self.worker_model_label)
         row.addStretch(1)
@@ -3035,11 +3276,14 @@ class Dashboard(QMainWindow):
 
     def _refresh_model_manager_box(self):
         p, w = self.config.planner, self.config.worker
-        self.planner_model_label.setText(f"Planner: {p.get('provider', '?')} / {p.get('model', '?')}")
-        self.worker_model_label.setText(f"Worker: {w.get('provider', '?')} / {w.get('model', '?')}")
+        self.planner_model_label.setText(
+            f"Planner: {p.get('provider', '?')} / {p.get('model', '?')}"
+        )
+        self.worker_model_label.setText(
+            f"Worker: {w.get('provider', '?')} / {w.get('model', '?')}"
+        )
         self.model_manager_note.setText(
-            "(no config.yaml found -- using built-in mock provider)"
-            if not os.path.exists("config.yaml") else ""
+            "\u25B8 change either under the chat box, or in Settings."
         )
 
     def _on_settings_clicked(self):

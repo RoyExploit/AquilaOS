@@ -37,6 +37,14 @@ d.home_files.update_open_list([])
 app.processEvents()
 print("code column hidden with no tabs ->", not d.home_tabs.isVisible())
 
+# left column has no dead space: the open-files section hides when empty
+print("open-files section hidden when empty ->", not d.home_files.open_section.isVisible())
+
+d.home_files._open_file(d.home_files.fs_model.index(f))
+d.home_files.update_open_list(d.home_tabs.open_paths())
+app.processEvents()
+print("open-files section shown when open ->", d.home_files.open_section.isVisible())
+
 d.home_files._open_file(d.home_files.fs_model.index(f))
 app.processEvents()
 print("opened tabs ->", d.home_tabs.tabs.count(),
@@ -207,6 +215,51 @@ print("code toggle removed ->", not hasattr(d.home_files, "code_toggle"))
 d._append_log("log-line-check-123")
 app.processEvents()
 print("log pane receives lines ->", "log-line-check-123" in d.log_view.toPlainText())
+
+# ---------- chat sessions: one conversation per task ----------
+from agentos.sessions import SessionStore
+p.session_title_label.setText("placeholder")  # ensure attribute exists
+first_id = p.session["id"]
+p.append_user("Build a weather dashboard")
+assert p.session_store.load(first_id) is not None, "session not persisted"
+stored = p.session_store.load(first_id)
+assert any(m.get("text") == "Build a weather dashboard" for m in stored["messages"]), \
+    "user message not saved into the session"
+ctx = SessionStore.context_block(stored)
+print("session context carries task ->", "Task:" in ctx and "weather dashboard" in ctx)
+
+p.new_chat(); app.processEvents()
+assert p.session["id"] != first_id, "new chat did not create a new session"
+old_texts = [m.get("text", "") for m in p.session.get("messages", [])]
+assert not any("weather dashboard" in t for t in old_texts), \
+    "new chat inherited old messages"
+print("new chat messages are fresh ->", old_texts)
+ctx2 = SessionStore.context_block(p.session)
+print("new chat has clean context ->", "weather dashboard" not in ctx2)
+print("chats listed ->", [s["id"][:8] for s in p.session_store.list()][:3])
+assert len(p.session_store.list()) >= 2, "old chats not kept"
+
+p.switch_chat(first_id); app.processEvents()
+labels = [l.text() for l in p.chat_log.findChildren(QLabel)]
+print("switch back restores history ->",
+      any("weather dashboard" in t for t in labels))
+# title: rename the restored chat (auto-titling runs in _on_send)
+p.session["title"] = "Weather dashboard"
+p.session_store.save(p.session)
+p._render_session()
+print("switch back shows title ->", "Weather dashboard" in p.session_title_label.text())
+titles = [s["title"] for s in p.session_store.list()]
+print("chat list keeps task titles ->", "Weather dashboard" in titles, titles[:3])
+
+# model link is under the chat box (plain underlined text, no pills)
+print("model link style ->", p.model_chip.objectName() == "modelLink",
+      repr(p.model_chip.text()))
+print("role chooser hidden from header ->", not p.role_combo.isVisible())
+
+# cleanup sessions created by this test
+for s in p.session_store.list():
+    p.session_store.delete(s["id"])
+p.new_chat()
 
 # let any in-flight model-catalog fetch finish before the app goes away
 d.chat_panel.wait_for_model_fetch()

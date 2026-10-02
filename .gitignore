@@ -15,6 +15,8 @@ ui_state.json
 agentos_memory.sqlite3
 *.sqlite3
 workspace/
+# Local conversation history (one JSON file per chat/session).
+chats/
 
 # ------------------------------------------------------------------ #
 # Python
