@@ -1,4 +1,4 @@
-﻿"""AquilaOS Dashboard (AgentOS engine) - single file.
+"""AquilaOS Dashboard (AgentOS engine) - single file.
 
 A PyQt6 desktop UI wired directly to the real Phase 1+2 engine
 (agentos.brain.CoreBrain + agentos.agents.MultiAgentCoordinator). It does
@@ -493,7 +493,7 @@ class ChatPanel(QWidget):
         )
         self.role_combo.currentIndexChanged.connect(self._refresh_role_chip)
 
-        self.new_chat_button = QPushButton("ï¼‹  New chat")
+        self.new_chat_button = QPushButton("＋  New chat")
         self.new_chat_button.setObjectName("thinkToggle")
         self.new_chat_button.setToolTip(
             "Start a fresh task in its own conversation. Each chat keeps its\n"
@@ -503,7 +503,7 @@ class ChatPanel(QWidget):
         head.addWidget(self.new_chat_button)
         self.new_chat_button.setVisible(False)   # lives in the sidebar now
 
-        self.chats_button = QPushButton("ðŸ•˜  Chats")
+        self.chats_button = QPushButton("🕘  Chats")
         self.chats_button.setObjectName("thinkToggle")
         self.chats_button.setToolTip(
             "Open a previous conversation (one per task/project)."
@@ -875,7 +875,7 @@ class ChatPanel(QWidget):
 
     def _open_chats_menu(self):
         menu = QMenu(self)
-        menu.addAction("ï¼‹ New chat", self.new_chat)
+        menu.addAction("＋ New chat", self.new_chat)
         sessions = self.session_store.list()
         if sessions:
             menu.addSeparator()
